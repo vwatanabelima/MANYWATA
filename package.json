@@ -1,0 +1,10 @@
+{
+  "name": "ig-webhook",
+  "version": "1.0.0",
+  "description": "Instagram comment-to-DM webhook (private replies) on Vercel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
