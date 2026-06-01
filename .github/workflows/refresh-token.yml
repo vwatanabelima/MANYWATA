@@ -1,0 +1,23 @@
+name: Renovar token Instagram
+
+on:
+  schedule:
+    # toda segunda 06:00 UTC (cada run estende +60 dias; semanal dá folga enorme)
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {} # permite rodar manual pelo botão "Run workflow"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Renovar token e atualizar Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: node scripts/refresh-token.mjs
