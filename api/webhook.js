@@ -33,16 +33,16 @@ export default async function handler(req, res) {
       return res.status(401).send("Bad signature");
     }
 
-    // Responde 200 rápido — processa depois. Meta exige resposta < ~5s.
-    res.status(200).send("EVENT_RECEIVED");
-
+    // IMPORTANTE: em serverless (Vercel) a função encerra ao enviar a resposta.
+    // Então processamos ANTES de responder, senão o fetch do DM é cortado no meio.
     let payload;
     try { payload = JSON.parse(raw.toString("utf8")); }
-    catch { return; }
+    catch { return res.status(200).send("EVENT_RECEIVED"); }
 
     try { await processEvents(payload); }
     catch (err) { console.error("processEvents error:", err); }
-    return;
+
+    return res.status(200).send("EVENT_RECEIVED");
   }
 
   res.status(405).send("Method Not Allowed");
