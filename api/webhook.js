@@ -9,6 +9,8 @@ const GRAPH = "https://graph.instagram.com/v21.0";
 // Resposta automática. Edite o texto / palavra-gatilho como quiser.
 const TRIGGER = (process.env.IG_TRIGGER_WORD || "").toLowerCase(); // vazio = responde todo comentário
 const REPLY_TEXT = process.env.IG_REPLY_TEXT || "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.";
+// Resposta pública no próprio comentário. Vazio = não responde publicamente.
+const PUBLIC_REPLY_TEXT = process.env.IG_PUBLIC_REPLY_TEXT || "Te chamei no direct! 📩";
 
 // Vercel: precisamos do corpo cru pra validar a assinatura do Meta.
 export const config = { api: { bodyParser: false } };
@@ -89,8 +91,8 @@ async function processEvents(payload) {
       if (!commentId) continue;
 
       await sendPrivateReply(commentId);
-      // (opcional) responder publicamente também:
-      // await replyToComment(commentId, "Te chamei no direct! 📩");
+      // responde publicamente no próprio comentário (se configurado)
+      if (PUBLIC_REPLY_TEXT) await replyToComment(commentId, PUBLIC_REPLY_TEXT);
     }
   }
 }
