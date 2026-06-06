@@ -1,16 +1,11 @@
 import crypto from "node:crypto";
+import { RULES } from "./rules.js"; // regras palavra-gatilho → ação (edite rules.js)
 
 // ── Config via env vars (set no painel da Vercel) ─────────────────────────
 const VERIFY_TOKEN = process.env.IG_VERIFY_TOKEN;   // string que VOCÊ inventou
 const ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN;   // token long-lived da conta IG
 const APP_SECRET   = process.env.IG_APP_SECRET;     // "Chave secreta do app" do Meta
 const GRAPH = "https://graph.instagram.com/v21.0";
-
-// Resposta automática. Edite o texto / palavra-gatilho como quiser.
-const TRIGGER = (process.env.IG_TRIGGER_WORD || "").toLowerCase(); // vazio = responde todo comentário
-const REPLY_TEXT = process.env.IG_REPLY_TEXT || "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.";
-// Resposta pública no próprio comentário. Vazio = não responde publicamente.
-const PUBLIC_REPLY_TEXT = process.env.IG_PUBLIC_REPLY_TEXT || "Te chamei no direct! 📩";
 
 // Vercel: precisamos do corpo cru pra validar a assinatura do Meta.
 export const config = { api: { bodyParser: false } };
@@ -86,19 +81,21 @@ async function processEvents(payload) {
 
       // não responde os próprios comentários
       if (fromId && entry.id && fromId === entry.id) continue;
-      // filtro por palavra-gatilho (se configurado)
-      if (TRIGGER && !text.includes(TRIGGER)) continue;
       if (!commentId) continue;
 
-      await sendPrivateReply(commentId);
-      // responde publicamente no próprio comentário (se configurado)
-      if (PUBLIC_REPLY_TEXT) await replyToComment(commentId, PUBLIC_REPLY_TEXT);
+      // acha a primeira regra cuja palavra-gatilho está no comentário
+      const rule = RULES.find((r) => text.includes(r.keyword.toLowerCase()));
+      if (!rule) continue; // nenhuma palavra bateu → ignora
+
+      console.log(`comentário ${commentId} casou regra "${rule.keyword}"`);
+      await sendPrivateReply(commentId, rule.dm);
+      if (rule.publicReply) await replyToComment(commentId, rule.publicReply);
     }
   }
 }
 
 // DM privado — 1 por comentário, dentro de 7 dias
-async function sendPrivateReply(commentId) {
+async function sendPrivateReply(commentId, text) {
   const r = await fetch(`${GRAPH}/me/messages`, {
     method: "POST",
     headers: {
@@ -107,7 +104,7 @@ async function sendPrivateReply(commentId) {
     },
     body: JSON.stringify({
       recipient: { comment_id: commentId },
-      message: { text: REPLY_TEXT },
+      message: { text },
     }),
   });
   const data = await r.json().catch(() => ({}));
