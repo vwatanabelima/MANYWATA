@@ -10,7 +10,7 @@
 export const RULES = [
   {
     keyword: "quebra",
-    dm: "Bem-vindo à Quebra 🔥 entra na nossa waitlist e garante o acesso antecipado: https://SUA-WAITLIST-AQUI",
+    dm: "Bem-vindo à Quebra 🔥 entra na nossa waitlist e garante o acesso antecipado: https://www.iadequebrada.com.br/comunidade#waitlist",
     publicReply: "Te mandei o link da waitlist no direct! 📩",
   },
   {
