@@ -14,6 +14,11 @@ export const RULES = [
     publicReply: "Te mandei o link da waitlist no direct! 📩",
   },
   {
+    keyword: "agente",
+    dm: "Salve! Vi que cê quer o agente 🤖 Ele fica no teu WhatsApp e Insta respondendo cliente sozinho, 24h. R$49,90 e é teu — usa no teu corre ou revende pra outros comércios. Olha como funciona aqui: https://www.iadequebrada.com.br/agente-whatsapp. Qualquer dúvida me chama nesse direct mesmo.",
+    publicReply: "Te chamei no direct! 🤖📩",
+  },
+  {
     keyword: "quero",
     dm: "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.",
     publicReply: "Te chamei no direct! 📩",
