@@ -19,6 +19,11 @@ export const RULES = [
     publicReply: "Te chamei no direct! 🤖📩",
   },
   {
+    keyword: "setup",
+    dm: "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.",
+    publicReply: "Te chamei no direct! 📩",
+  },
+  {
     keyword: "quero",
     dm: "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.",
     publicReply: "Te chamei no direct! 📩",
