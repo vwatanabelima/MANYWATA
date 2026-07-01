@@ -20,12 +20,12 @@ export const RULES = [
   },
   {
     keyword: "setup",
-    dm: "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.",
-    publicReply: "Te chamei no direct! 📩",
+    dm: "Salve! Vi que cê quer o Setup 🚀 É o kit inicial pra montar teu esquema com IA do zero, sem enrolação. Tudo que cê precisa pra começar hoje tá aqui: https://www.iadequebrada.com.br/setup-r0. Qualquer dúvida me chama nesse direct mesmo.",
+    publicReply: "Te chamei no direct! 🚀📩",
   },
   {
     keyword: "quero",
-    dm: "Oi! Vi seu comentário 🙌 te mandei o link aqui no direct.",
-    publicReply: "Te chamei no direct! 📩",
+    dm: "Salve! Vi que cê quer entrar 🚀 O Setup é o kit inicial pra montar teu esquema com IA do zero — tudo pra cê começar hoje. Olha aqui: https://www.iadequebrada.com.br/setup-r0. Qualquer dúvida me chama nesse direct mesmo.",
+    publicReply: "Te chamei no direct! 🚀📩",
   },
 ];
