@@ -5,6 +5,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev"
+    "dev": "vercel dev",
+    "test": "vitest run",
+    "insights": "node scripts/insights.mjs",
+    "insights:eterniza": "node scripts/insights.mjs --conta eterniza",
+    "insights:todas": "node scripts/insights.mjs --conta all"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
   }
 }

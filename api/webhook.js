@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
-import { RULES } from "./rules.js"; // regras palavra-gatilho → ação (edite rules.js)
+// contas atendidas + suas regras palavra-gatilho → ação (edite contas.js)
+import { contaPorUserId, regraQueCasa, tokenDaConta } from "./contas.js";
 
 // ── Config via env vars (set no painel da Vercel) ─────────────────────────
+// VERIFY_TOKEN e APP_SECRET são do APP, valem pra todas as contas.
+// O token de acesso é POR CONTA e vive em contas.js (campo tokenEnv).
 const VERIFY_TOKEN = process.env.IG_VERIFY_TOKEN;   // string que VOCÊ inventou
-const ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN;   // token long-lived da conta IG
 const APP_SECRET   = process.env.IG_APP_SECRET;     // "Chave secreta do app" do Meta
 const GRAPH = "https://graph.instagram.com/v21.0";
 
@@ -71,36 +73,47 @@ async function processEvents(payload) {
   if (payload.object !== "instagram") return;
 
   for (const entry of payload.entry || []) {
+    // entry.id é o user_id da conta que RECEBEU o comentário.
+    const conta = contaPorUserId(entry.id);
+    if (!conta) {
+      console.warn(`conta desconhecida no webhook: entry.id=${entry.id} — ignorado`);
+      continue;
+    }
+
+    const token = tokenDaConta(conta);
+    if (!token) {
+      console.error(`${conta.slug}: env var ${conta.tokenEnv} não está setado na Vercel`);
+      continue;
+    }
+
     for (const change of entry.changes || []) {
       if (change.field !== "comments") continue;
 
       const c = change.value || {};
       const commentId = c.id;
-      const text = (c.text || "").toLowerCase();
       const fromId = c.from?.id;
 
       // não responde os próprios comentários
       if (fromId && entry.id && fromId === entry.id) continue;
       if (!commentId) continue;
 
-      // acha a primeira regra cuja palavra-gatilho está no comentário
-      const rule = RULES.find((r) => text.includes(r.keyword.toLowerCase()));
+      const rule = regraQueCasa(conta.regras, c.text);
       if (!rule) continue; // nenhuma palavra bateu → ignora
 
-      console.log(`comentário ${commentId} casou regra "${rule.keyword}"`);
-      await sendPrivateReply(commentId, rule.dm);
-      if (rule.publicReply) await replyToComment(commentId, rule.publicReply);
+      console.log(`[${conta.slug}] comentário ${commentId} casou regra "${rule.keyword}"`);
+      await sendPrivateReply(commentId, rule.dm, token);
+      if (rule.publicReply) await replyToComment(commentId, rule.publicReply, token);
     }
   }
 }
 
 // DM privado — 1 por comentário, dentro de 7 dias
-async function sendPrivateReply(commentId, text) {
+async function sendPrivateReply(commentId, text, token) {
   const r = await fetch(`${GRAPH}/me/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
       recipient: { comment_id: commentId },
@@ -113,12 +126,12 @@ async function sendPrivateReply(commentId, text) {
 }
 
 // (opcional) resposta pública no próprio comentário
-async function replyToComment(commentId, text) {
+async function replyToComment(commentId, text, token) {
   const r = await fetch(`${GRAPH}/${commentId}/replies`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({ message: text }),
   });
