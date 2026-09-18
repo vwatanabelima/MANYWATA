@@ -33,7 +33,10 @@ export const CONTAS = [
     regras: [
       {
         keyword: "quero",
-        dm: "Salve! Vi seu comentário. A gente transforma a foto de quem você ama numa carta colecionável, desenhada por um ilustrador e entregue na sua casa. Preços e modelos aqui: https://eternizacards.com.br/?utm_source=instagram&utm_medium=dm&utm_campaign=comentario&utm_content=quero. Qualquer dúvida, responde por aqui mesmo.",
+        // Público é colecionador de TCG, não quebrada. Mede em mm, já tem
+        // sleeve em casa e não quer carta ruim impressa — daí 63x88 e o OK
+        // antes da impressão. "48h ÚTEIS": sem o "úteis" vira promessa errada.
+        dm: "Oi! Vi seu comentário. Você manda a foto, nosso ilustrador desenha no estilo de carta de jogo (com nome e ataque da pessoa) e a gente imprime em papel holográfico, 63x88mm, o tamanho oficial. Cabe em sleeve e toploader normal. A arte chega no seu WhatsApp em até 48h úteis e só vai pra impressão depois do seu OK. Modelos e preços: https://eternizacards.com.br/?utm_source=instagram&utm_medium=dm&utm_campaign=comentario&utm_content=quero",
         publicReply: "Te chamei no direct! 📩",
       },
     ],
