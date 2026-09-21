@@ -43,8 +43,13 @@ const envs = list.envs || list;
 async function renovar(conta) {
   const chave = conta.tokenEnv;
 
-  const envVar = envs.find((e) => e.key === chave);
-  if (!envVar) throw new Error(`env var ${chave} não encontrado no projeto.`);
+  // Pode haver MAIS DE UMA entrada com a mesma chave (uma por target). Pegar a
+  // primeira faz o script ler uma entrada velha de preview e concluir errado.
+  const candidatos = envs.filter((e) => e.key === chave);
+  if (!candidatos.length) throw new Error(`env var ${chave} não encontrado no projeto.`);
+
+  const envVar =
+    candidatos.find((e) => (e.target || []).includes("production")) || candidatos[0];
 
   const getRes = await fetch(
     `https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env/${envVar.id}?decrypt=true${teamAmp}`,
@@ -55,7 +60,19 @@ async function renovar(conta) {
 
   const currentToken = cur.value;
   if (!currentToken || currentToken.length < 50) {
-    throw new Error(`token atual inválido/ilegível. Confira se ${chave} é tipo "Encrypted" (não "Sensitive") na Vercel.`);
+    // Diagnóstico sem vazar o valor: quantas entradas existem, de que tipo,
+    // em que target e quanto veio. "Secret" na UI = type "sensitive" na API e
+    // NUNCA volta valor; o tipo que o cron precisa é "Config"/"encrypted".
+    const mapa = candidatos
+      .map((e) => `${e.id} type=${e.type} target=[${(e.target || []).join("|")}]`)
+      .join(" ; ");
+    throw new Error(
+      `não consegui LER o valor de ${chave}. ` +
+        `entradas com essa chave: ${candidatos.length} -> ${mapa}. ` +
+        `escolhida: ${envVar.id} (type=${envVar.type}), ` +
+        `veio ${currentToken ? `${currentToken.length} chars` : "vazio"}. ` +
+        `type "sensitive" (rótulo "Secret" na UI) é write-only — recrie como "Config".`
+    );
   }
 
   // Renova na Meta (estende +60 dias)
