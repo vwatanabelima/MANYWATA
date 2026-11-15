@@ -69,7 +69,7 @@ npm test
 
 Cobre o cadastro de contas e o casamento de regras. Os testes de invariante existem pra pegar o pior bug possível aqui: duas contas apontando pro mesmo token, o que faria o DM de uma sair pela outra em silêncio.
 
-`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza depois de sucesso, de erro da rota e de upload parcial, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro.
+`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro.
 
 ## Insights orgânicos
 
@@ -95,7 +95,7 @@ Publica no Instagram pela API oficial (Instagram API with Instagram Login), **nu
 3. **O Vinicius vê as imagens e o texto antes** (os próprios arquivos da pasta de render) e aprova.
 4. **Com o ok dele**, alguém roda o publicar (`confirmar: true` / `--confirmar`). A rota cria os containers e **posta direto**. Não tem rascunho nem preview do lado do servidor: o que for mandado é o que vai pro perfil.
 
-⚠️ Publicar não tem volta pela API. Rode **uma vez**. Se der timeout ou falha de rede no meio, **confira o perfil antes de rodar de novo** (pode ter publicado).
+⚠️ Publicar não tem volta pela API. Rode **uma vez**. Se der timeout ou falha de rede no meio, **confira o perfil antes de rodar de novo** (pode ter publicado). Nesses casos o CLI mantém as imagens no bucket e mostra o comando `limpar` pra usar depois.
 
 ### Endpoints
 
@@ -122,14 +122,28 @@ Ordem do que a rota faz:
 
 1. **Sem tocar no Instagram:** método (405), `PUBLICAR_SECRET` configurado (503), Bearer (401), `confirmar` (400), tipo (400/501), conta (400), itens/URLs/legenda (400), token da conta (503). Qualquer recusa aqui = **zero** chamada ao Graph.
 2. `content_publishing_limit`: cota de 24h atingida → **429 sem criar nenhum container**.
-3. Um container-filho por slide, na ordem; espera cada um `FINISHED`.
+3. Um container-filho por slide, **todos ao mesmo tempo** (cada `POST /media` leva segundos porque o Meta baixa a imagem antes de responder; em sequência, 9 slides estouravam o tempo). Os ids voltam na ordem dos slides, não na ordem em que o Meta responde. Espera os filhos `FINISHED`, também em paralelo; se um falhar (criação recusada ou `ERROR`), a espera dos outros é cancelada e o erro diz qual slide foi (`slide 5 de 9: ...`), sem publicar nada.
 4. Container `CAROUSEL` com `children` na mesma ordem + `caption`; espera `FINISHED`.
 5. `media_publish`.
 6. Permalink. Se falhar aqui, o post **já está no ar**: volta **200 com `aviso`**, pra ninguém repetir achando que não foi.
 
 Resposta 200: `{"mediaId", "permalink", "username", "quota": {"usado", "total"}, "conta", "tipo"}` (+ `aviso` se o permalink falhou).
 
-Erros são `{"erro": "..."}`: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer ou Bearer errado · **405** método errado · **409** container já publicado · **410** container expirou no Instagram · **429** limite de 24h atingido (nada criado) · **501** tipo não implementado · **502** o Instagram recusou ou deu `ERROR` (mensagem do Meta, sem token; nada publicado) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo (nada publicado).
+Erros são `{"erro": "...", "publicado": false}`. O `publicado: false` só vem quando o `media_publish` **não foi chamado** (certeza de que nada foi pro perfil). Se o `media_publish` foi chamado e deu erro, o campo **não vem**: resultado indefinido, confira o perfil. Status: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer ou Bearer errado · **405** método errado · **409** container já publicado · **410** container expirou no Instagram · **429** limite de 24h atingido (nada criado) · **501** tipo não implementado · **502** o Instagram recusou ou deu `ERROR` (mensagem do Meta, sem token; nada publicado) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo (nada publicado; a mensagem traz o tempo que a rota realmente esperou e o último status, ex.: `não ficou pronto em 240s (último status: IN_PROGRESS)`).
+
+### Limites de tempo
+
+Todos em [`api/_lib/tempos.js`](api/_lib/tempos.js), que explica a relação entre eles:
+
+| O quê | Valor | Observação |
+|-------|-------|------------|
+| `maxDuration` da função (`vercel.json`, `api/midia/*.js` e `api/carrossel/*.js`) | **300s** | plano Hobby com Fluid Compute permite até 300s. Um teste confere que o `vercel.json` bate com `MAX_DURATION_S` |
+| Orçamento dos containers (criar + esperar `FINISHED`) | **240s** | os 60s restantes são folga pra espera mínima, `CAROUSEL`, `media_publish`, permalink e resposta |
+| Espera mínima por container | **10s e 3 checagens** | mesmo que o orçamento já tenha acabado (ou seja zero), a rota checa de verdade e espera isso antes de dar 504 |
+| Polling do `status_code` | **2s → 5s** | cresce 1,5x a cada volta |
+| Timeout do CLI chamando a rota | **330s** | maior que o `maxDuration`, senão o CLI desistiria antes da resposta |
+
+Mudou o `maxDuration`? Mude `vercel.json` e `tempos.js` juntos (o teste reclama se não baterem). Se o Fluid Compute estiver desligado no projeto, o Hobby volta a limitar em 60s e o deploy recusa o `maxDuration: 300`.
 
 Se der 502/504 em container, sobram containers órfãos no Instagram. Eles não aparecem no perfil e o Meta descarta em 24h.
 
@@ -163,12 +177,17 @@ npm run midia:publicar -- carrossel/drop-natal/render --confirmar --conta eterni
 
 # alternativa: imagens já publicadas em outro lugar (não sobe nem apaga nada)
 node scripts/midia.mjs publicar carrossel/drop-natal/render --base-url https://exemplo.com/c1 --confirmar
+
+# apagar os temporários de uma publicação de resultado indefinido (depois de conferir o perfil)
+node scripts/midia.mjs limpar drop-natal-20261115-0105-a1b2c3 --confirmar
 ```
 
 - Lê `slide-NN.jpg` da pasta em ordem numérica (`slide-2` antes de `slide-10`) e a legenda de `instagram-post.txt` na mesma pasta.
 - **Sem `--confirmar` ele recusa**, inclusive com `--dry-run`.
 - `--conta` padrão: `eterniza`.
-- **Sem `--base-url`** (padrão): sobe os JPEGs pro Supabase Storage, publica e apaga (ver [hospedagem](#hospedagem-das-imagens)).
+- A chamada à rota pode levar **alguns minutos** (até 300s). O CLI espera até 330s e desiste (resultado indefinido, ver abaixo).
+- **Sem `--base-url`** (padrão): sobe os JPEGs pro Supabase Storage, publica e apaga **quando o resultado é definido** (ver [hospedagem](#hospedagem-das-imagens)).
+- `limpar <prefixo> --confirmar`: apaga **uma** pasta do bucket `instagram-temp` (lista o que tem nela e apaga). O prefixo é o que o CLI imprime (`<slug>-<AAAAMMDD-HHMM>-<aleatório>`; aceita também `instagram-temp/<prefixo>/`). Só `a-z`, `0-9` e `-`: nada de barra, `..` ou vazio. **Sem `--confirmar` recusa** sem chamar nada. Precisa das `SUPABASE_*` no ambiente.
 - **Com `--base-url`**: monta as URLs como `<--base-url>/<nome-do-arquivo>`; os JPEGs precisam já estar nesse endereço. Não toca no Storage e não precisa das `SUPABASE_*`.
 - `--dry-run`: não sobe nada e não chama a rota. Mostra os caminhos no bucket, as URLs públicas e o corpo que mandaria. Não exige as credenciais (só avisa se faltarem).
 - Lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`. `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` vêm **só do ambiente**. Nunca imprime segredo nem chave; mensagens de erro passam por `sanitizar()`.
@@ -196,11 +215,26 @@ O CLI só lê essas duas do ambiente: nunca de argumento de linha de comando (va
 1. **Sem rede:** `--confirmar`, pasta, 2 a 10 `slide-NN.jpg`, legenda (`instagram-post.txt`), `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` + `PUBLICAR_SECRET`, e cada arquivo com **até 8 MB** e começando com os bytes JPEG (`FF D8 FF`). Qualquer falha aqui = nada sobe.
 2. **Upload**, na ordem dos slides, pra `instagram-temp/<slug>-<AAAAMMDD-HHMM>-<aleatório>/slide-NN.jpg` (`POST /storage/v1/object/instagram-temp/<caminho>` com `x-upsert: false`). O slug é o nome da pasta pai de `render` (ou da própria pasta, se ela não se chama `render`), só `[a-z0-9-]`. Hora em UTC.
 3. **Publica**: chama `POST /api/midia/publicar` com as URLs públicas `<SUPABASE_URL>/storage/v1/object/public/instagram-temp/<caminho>`.
-4. **Apaga** os arquivos que subiu (`DELETE /storage/v1/object/instagram-temp` com `{"prefixes": [...]}`). Isso roda **sempre**: depois de publicar, depois de erro da rota, depois de upload parcial (apaga o que chegou a subir) e também quando o resultado é incerto (timeout ou falha de rede chamando a rota).
+4. **Apaga** os arquivos que subiu (`DELETE /storage/v1/object/instagram-temp` com `{"prefixes": [...]}`), **só quando o resultado é definido**:
 
-Por que apagar mesmo no caso incerto: o Meta baixa as imagens quando cria os containers, então o post publicado não depende mais delas. Se o apagar pegar uma publicação ainda em andamento, o pior caso é o container dar `ERROR` e nada ir pro ar. Nos dois casos a mensagem manda **conferir o perfil antes de rodar de novo**. Rodar de novo usa uma pasta nova no bucket (o carimbo muda), então não tem colisão.
+| Resultado | Apaga? |
+|-----------|--------|
+| 200 com `mediaId` (publicou) | **sim** |
+| Upload falhou antes de chamar a rota (apaga o que chegou a subir) | **sim** |
+| Erro da rota com corpo JSON `{"erro", "publicado": false}` e status **diferente de 504** (ex.: 400, 429, 502 de container `ERROR`) | **sim** |
+| **504**, inclusive o 504 da nossa rota com `publicado: false` (container não ficou pronto) | **não** |
+| Falha de rede, timeout do CLI (330s), resposta sem JSON / sem detalhe (ex.: 504 da própria Vercel), 200 sem `mediaId` | **não** |
+| Erro sem `publicado: false` (o `media_publish` foi chamado e falhou) | **não** |
 
-Se **apagar falhar**, o publish continua valendo (código de saída 0) e o CLI imprime um aviso com os caminhos pra apagar à mão no painel do Supabase (Storage → `instagram-temp`). Mesma coisa se você interromper com Ctrl+C no meio: confira o bucket e apague o que tiver sobrado.
+Quando **não** apaga, o CLI sai com erro, imprime os caminhos e o que fazer:
+
+1. Conferir o perfil (pode levar alguns minutos pra aparecer).
+2. Se **não** publicou: rodar o `publicar` de novo. Usa uma pasta nova no bucket (o carimbo muda), então não colide com a anterior.
+3. Depois, publicado ou não, apagar os temporários: `node scripts/midia.mjs limpar <prefixo> --confirmar` (ou à mão no painel).
+
+Por que não apagar no caso indefinido: o Instagram pode ainda estar processando containers que apontam pra essas URLs. Apagar no meio pode deixar um post quebrado ou fazer um retry falhar. E por que o 504 da nossa rota também entra aqui, se ela garante que o `media_publish` não foi chamado: os containers continuam processando do lado do Meta depois que a rota desiste, e a regra fica conservadora de propósito. Manter custa alguns KB no bucket por algumas horas; apagar cedo demais não tem volta.
+
+Se **apagar falhar**, o publish continua valendo (código de saída 0) e o CLI imprime um aviso com o comando `limpar` e os caminhos. Se você interromper com Ctrl+C no meio, o resultado é indefinido: confira o perfil e depois rode o `limpar` com o prefixo que apareceu em "Subindo ... para instagram-temp/<prefixo>/".
 
 ### Envs
 
@@ -224,8 +258,8 @@ Depois de criar: **`vercel --prod` de novo**.
 ### Como funciona por dentro
 
 - `api/_lib/` não vira rota na Vercel (prefixo `_`). Lá ficam `seguranca.js` (auth, sanitização, validação de URL), `instagram-publicacao.js` (cliente do Graph com `fetch`/`sleep`/`now` injetáveis + registro `TIPOS`) e `rotas-midia.js` (a rota).
-- **Sem banco nem store** na rota: cada chamada é independente. O único armazenamento é o bucket temporário que o CLI usa (`scripts/_storage.mjs`: `lerCredenciaisStorage`, `lerSlidesJpeg`, `enviarParaStorage`, `apagarDoStorage`, todos com `fetch` injetável).
-- Tempo: a função tem 60s (`vercel.json`). Os containers têm até ~45s; o resto fica pro `media_publish` e o permalink. Imagem costuma ficar `FINISHED` na hora.
+- **Sem banco nem store** na rota: cada chamada é independente. O único armazenamento é o bucket temporário que o CLI usa (`scripts/_storage.mjs`: `lerCredenciaisStorage`, `lerSlidesJpeg`, `enviarParaStorage`, `listarDoStorage`, `apagarDoStorage`, todos com `fetch` injetável).
+- Tempo: a função tem 300s (`vercel.json`); os containers têm até 240s; o resto fica pro `media_publish` e o permalink (ver [Limites de tempo](#limites-de-tempo)). Filhos são criados e esperados em paralelo (`emParalelo` em `instagram-publicacao.js`), então 9 slides levam o tempo do slide mais lento, não a soma.
 - O token vai no header `Authorization: Bearer`, nunca na URL. Toda mensagem de erro e de log passa por `sanitizar()`, que tira `access_token=`, `Bearer ...` e os segredos conhecidos.
 
 ### O que falta para Reels e Stories
@@ -235,7 +269,7 @@ O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `RE
 **Reels**
 1. `validar()`: exatamente 1 item com URL https de vídeo (MP4/MOV; checar extensão), legenda com `validarLegenda`, `cover_url` opcional (JPEG público, via `validarUrlPublica`), `share_to_feed` opcional (booleano estrito).
 2. `criarContainers()`: `criarContainer({ media_type: "REELS", video_url, caption, cover_url?, share_to_feed? })`.
-3. **Tempo**: vídeo leva minutos pra ficar `FINISHED`, não cabe em 60s. Vai precisar dividir em duas chamadas (uma cria o container e devolve o id, outra checa o status e publica quando estiver `FINISHED`), mantendo `confirmar: true` e a checagem de cota antes de criar.
+3. **Tempo**: vídeo pode levar vários minutos pra ficar `FINISHED`; nem os 300s da função garantem. Vai precisar dividir em duas chamadas (uma cria o container e devolve o id, outra checa o status e publica quando estiver `FINISHED`), mantendo `confirmar: true` e a checagem de cota antes de criar.
 4. Limites do Meta (duração, proporção recomendada 9:16, tamanho do arquivo): conferir na doc de Content Publishing na hora de implementar. Pela URL não dá pra checar; documentar e deixar o `status` `ERROR` do Meta explicar.
 5. Hospedagem: o bucket `instagram-temp` só aceita `image/jpeg` até 8 MB. Vídeo vai precisar de outra regra de MIME/tamanho (ou outro bucket), e de manter o arquivo até o container ficar `FINISHED`, que pode levar minutos.
 6. Testes: os mesmos do carrossel trocando os params + o fluxo em duas chamadas.

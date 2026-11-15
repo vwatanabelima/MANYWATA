@@ -1,7 +1,7 @@
 // Hospedagem temporária dos JPEGs no Supabase Storage (projeto eternizacards,
 // bucket público instagram-temp). Quem baixa as imagens é o servidor do Meta,
 // então elas precisam estar numa URL https pública só durante a publicação;
-// depois o CLI apaga.
+// depois o CLI apaga (quando o resultado é definido; ver scripts/midia.mjs).
 //
 // Credenciais SÓ do ambiente (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY), que o
 // operador carrega de um arquivo protegido:
@@ -157,6 +157,46 @@ export async function apagarDoStorage({ caminhos, cred, fetch = globalThis.fetch
     throw erroStorage(`Falha de rede apagando do Storage: ${e?.message}`, cred);
   }
   if (!r.ok) throw erroStorage(`Storage recusou apagar (HTTP ${r.status}): ${await detalhe(r)}`, cred);
+}
+
+// Prefixo que o CLI cria: <slug>-<AAAAMMDD-HHMM>-<aleatório>, só [a-z0-9-].
+// Aceita também "instagram-temp/<prefixo>/" (do jeito que o CLI imprime).
+// Recusa barra no meio, "..", vazio: o limpar nunca sai de UMA pasta.
+export function normalizarPrefixo(valor) {
+  let p = String(valor ?? "").trim();
+  if (p.startsWith(`${BUCKET}/`)) p = p.slice(BUCKET.length + 1);
+  p = p.replace(/\/+$/, "");
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(p)) {
+    throw new Error(`prefixo inválido: "${valor ?? ""}". Esperado algo como drop-natal-20261115-0105-a1b2c3 (só a-z, 0-9 e -).`);
+  }
+  return p;
+}
+
+// Lista os arquivos de UMA pasta do bucket (POST /object/list/<bucket>).
+// O Storage devolve nomes relativos à pasta; subpasta vem com id null e fica
+// de fora (o CLI nunca cria subpasta). Devolve os caminhos completos.
+export async function listarDoStorage({ prefixo, cred, fetch = globalThis.fetch }) {
+  const caminhos = [];
+  const lote = 1000;
+  for (let offset = 0; ; offset += lote) {
+    let r;
+    try {
+      r = await fetch(`${cred.url}/storage/v1/object/list/${BUCKET}`, {
+        method: "POST",
+        headers: headers(cred.chave, "application/json"),
+        body: JSON.stringify({ prefix: prefixo, limit: lote, offset, sortBy: { column: "name", order: "asc" } }),
+      });
+    } catch (e) {
+      throw erroStorage(`Falha de rede listando ${BUCKET}/${prefixo}/: ${e?.message}`, cred);
+    }
+    if (!r.ok) throw erroStorage(`Storage recusou listar ${BUCKET}/${prefixo}/ (HTTP ${r.status}): ${await detalhe(r)}`, cred);
+    const itens = await r.json().catch(() => null);
+    if (!Array.isArray(itens)) throw erroStorage(`Storage devolveu uma listagem inválida pra ${BUCKET}/${prefixo}/.`, cred);
+    for (const item of itens) {
+      if (item?.id && typeof item.name === "string" && item.name) caminhos.push(`${prefixo}/${item.name}`);
+    }
+    if (itens.length < lote) return caminhos;
+  }
 }
 
 function erroStorage(msg, cred, caminhos) {

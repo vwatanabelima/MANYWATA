@@ -16,10 +16,9 @@
 import { contaPorSlug, tokenDaConta } from "../contas.js";
 import { ErroHttp, autenticar, sanitizar } from "./seguranca.js";
 import { criarPublicador, tipoDefinido } from "./instagram-publicacao.js";
-
-// A função da Vercel tem 60s (vercel.json). Os containers ficam com até 45s;
-// o resto é pro media_publish, o permalink e a resposta.
-const ORCAMENTO_CONTAINERS_MS = 45_000;
+// Orçamento dos containers (240s) dentro do maxDuration da função (300s,
+// vercel.json). A relação entre os tempos está explicada em tempos.js.
+import { ORCAMENTO_CONTAINERS_MS } from "./tempos.js";
 
 function contexto(opcoes = {}) {
   const env = opcoes.env || process.env;
@@ -33,11 +32,19 @@ function contexto(opcoes = {}) {
     tipoFixo: opcoes.tipoFixo,
     // tudo que nunca pode sair numa resposta/log; o token entra depois
     segredos: [env.PUBLICAR_SECRET].filter(Boolean),
+    // vira true imediatamente ANTES de chamar o media_publish: daí em diante
+    // um erro não garante que nada foi publicado
+    mediaPublishChamado: false,
   };
 }
 
 // Erro esperado (ErroHttp) volta com o status dele. Inesperado vira 500
 // genérico e o detalhe (sanitizado) vai só pro log.
+//
+// Se o media_publish NÃO foi chamado, o erro leva `publicado: false`: é
+// certeza que nada foi pro perfil (o CLI usa isso pra decidir se apaga os
+// temporários). Se foi chamado e deu erro, o campo fica de fora: resultado
+// indefinido, confira o perfil.
 async function tratar(res, ctx, fn) {
   try {
     return await fn();
@@ -46,7 +53,7 @@ async function tratar(res, ctx, fn) {
     const status = esperado ? e.status : 500;
     const mensagem = esperado ? sanitizar(e.message, ctx.segredos) : "erro interno; veja o log da função.";
     if (!esperado) console.error("midia: erro inesperado:", sanitizar(e?.stack || e?.message || e, ctx.segredos));
-    return res.status(status).json({ erro: mensagem });
+    return res.status(status).json({ erro: mensagem, ...(ctx.mediaPublishChamado ? {} : { publicado: false }) });
   }
 }
 
@@ -129,6 +136,7 @@ export async function rotaPublicar(req, res, opcoes = {}) {
     const containerId = await def.criarContainers(pub, dados, { restanteMs: () => prazo - ctx.now() });
 
     // ── 4. Publica ────────────────────────────────────────────────────────
+    ctx.mediaPublishChamado = true;
     const mediaId = await pub.publicarContainer(containerId);
     console.log(`[${conta.slug}] ${tipo} PUBLICADO: media ${mediaId} (container ${containerId}, ${dados.itens.length} itens).`);
 
