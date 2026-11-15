@@ -1,9 +1,9 @@
 // Publicação de mídia no Instagram (Instagram API with Instagram Login).
 //
-// O Meta publica em duas etapas, e a gente segue as mesmas duas:
-//   1. RASCUNHO: cria o "container" (POST /{user-id}/media) e espera ele
-//      ficar FINISHED. Nada aparece no perfil. O container vale 24h.
-//   2. PUBLICAR: POST /{user-id}/media_publish com o id do container.
+// Pelo lado do Meta, publicar é: criar o "container" (POST /{user-id}/media),
+// esperar ele ficar FINISHED e chamar POST /{user-id}/media_publish com o id
+// dele. A rota faz tudo numa chamada só (a aprovação do Vinicius acontece
+// antes, fora daqui).
 //
 // Este módulo não sabe nada de HTTP de entrada nem de autenticação (isso é
 // rotas-midia.js). Tudo que fala com o mundo é injetado (fetch, sleep, now),
@@ -86,7 +86,7 @@ export function criarPublicador({
         );
       }
       if (codigo === "EXPIRED") {
-        throw new ErroHttp(410, `container ${containerId} expirado, gere outro rascunho.`);
+        throw new ErroHttp(410, `container ${containerId} expirou no Instagram antes de publicar. Nada foi publicado; rode de novo.`);
       }
       if (codigo === "PUBLISHED") {
         throw new ErroHttp(409, `container ${containerId} já foi publicado. Nada foi feito.`);
@@ -165,9 +165,10 @@ export function exigirJpeg(url, rotulo) {
 
 // ── Registro de tipos ─────────────────────────────────────────────────────
 //
-// Cada tipo de mídia é uma entrada. As rotas são genéricas: pegam o tipo do
-// body, chamam validar() e criarContainers(), e assinam o rascunho. Pra ligar
-// Reels ou Stories é só implementar a entrada e virar `implementado: true`.
+// Cada tipo de mídia é uma entrada. A rota é genérica: pega o tipo do body,
+// chama validar() (antes de qualquer fetch) e criarContainers(), e publica o
+// container que voltar. Pra ligar Reels ou Stories é só implementar a entrada
+// e virar `implementado: true`.
 //
 //   validar(corpo)                     → { itens: [url...], legenda }  (ou ErroHttp 400)
 //   criarContainers(pub, dados, ctx)   → id do container FINAL, já FINISHED
@@ -187,9 +188,8 @@ export const TIPOS = {
       if (itens.length < min || itens.length > max) {
         throw new ErroHttp(400, `carrossel precisa de ${min} a ${max} itens (veio ${itens.length}).`);
       }
-      // PONTO DE EXTENSÃO (upload): hoje só URL pública. Quando tiver Vercel
-      // Blob (BLOB_READ_WRITE_TOKEN), o upload acontece ANTES, no CLI, e o que
-      // chega aqui continua sendo a URL pública devolvida pelo Blob.
+      // Só URL https pública: quem baixa a imagem é o servidor do Meta. Onde
+      // hospedar fica fora daqui (README, "Hospedagem das imagens").
       const urls = itens.map((item, i) => {
         const rotulo = `itens[${i}].url`;
         const url = validarUrlPublica(item?.url, rotulo);
@@ -225,8 +225,8 @@ export const TIPOS = {
   //     opcional (booleano)
   //   criarContainers: criarContainer({ media_type: "REELS", video_url,
   //     caption, cover_url?, share_to_feed? }) e aguardarStatus com timeout
-  //     maior — vídeo leva minutos, não cabe num request de 60s; precisa de
-  //     um GET de status separado (rascunho "processando").
+  //     maior — vídeo leva minutos, não cabe num request de 60s; precisa
+  //     dividir em "cria o container" + "checa status e publica".
   REELS: {
     implementado: false,
     descricao: "Reels (video_url, media_type=REELS, cover_url/share_to_feed opcionais)",

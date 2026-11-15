@@ -1,29 +1,19 @@
-// Peças de segurança das rotas de publicação (api/midia/*, api/carrossel/*).
+// Peças de segurança da rota de publicação (api/midia/*, api/carrossel/*).
 //
 // Mora em api/_lib/: na Vercel, arquivo ou pasta com prefixo "_" dentro de
 // api/ NÃO vira rota. Então nada aqui é acessível de fora.
 //
 // O que tem aqui:
-//   - ErroHttp: erro com status HTTP, que as rotas devolvem como está
+//   - ErroHttp: erro com status HTTP, que a rota devolve como está
 //   - exigirSegredo / autenticar: PUBLICAR_SECRET + Authorization: Bearer
-//   - assinarRascunho / lerRascunho: o "id" do rascunho é um token assinado
-//     (HMAC-SHA256), sem banco nem store
 //   - sanitizar: tira access_token / Bearer / segredos de qualquer texto
 //   - validarUrlPublica: só https, sem localhost nem IP privado
-//   - escaparHtml: pro preview
 
 import crypto from "node:crypto";
 
-// PUBLICAR_SECRET também é a raiz da chave que assina os rascunhos, então
-// segredo curto = assinatura fraca. Gere com: openssl rand -hex 32
+// O PUBLICAR_SECRET é a única coisa entre a internet e um post no perfil.
+// Segredo curto = adivinhável. Gere com: openssl rand -hex 32
 export const TAMANHO_MIN_SEGREDO = 32;
-
-// Rascunho vale 24h: é o tempo que o Instagram guarda um container não publicado.
-export const VALIDADE_RASCUNHO_MS = 24 * 60 * 60 * 1000;
-
-// Um id maior que isso não veio da gente (10 URLs + legenda de 2200 chars
-// cabem com folga). Corta antes de gastar CPU com HMAC/JSON.
-const TAMANHO_MAX_ID = 24_000;
 
 export class ErroHttp extends Error {
   constructor(status, mensagem) {
@@ -53,85 +43,26 @@ export function exigirSegredo(env = process.env) {
 
 // Compara em tempo constante. O hash antes iguala os tamanhos, assim
 // timingSafeEqual não estoura e o tamanho do segredo não vaza pelo tempo.
-export function iguaisSeguro(a, b) {
+function iguaisSeguro(a, b) {
   const ha = crypto.createHash("sha256").update(String(a)).digest();
   const hb = crypto.createHash("sha256").update(String(b)).digest();
   return crypto.timingSafeEqual(ha, hb);
 }
 
-export function bearerDoHeader(req) {
+function bearerDoHeader(req) {
   const header = req.headers?.authorization;
   if (!header) return undefined;
   const m = /^Bearer\s+(.+)$/i.exec(String(header));
   return m ? m[1].trim() : "";
 }
 
-// Exige "Authorization: Bearer <PUBLICAR_SECRET>". Devolve o segredo.
+// Exige "Authorization: Bearer <PUBLICAR_SECRET>".
 export function autenticar(req, env = process.env) {
   const segredo = exigirSegredo(env);
   const recebido = bearerDoHeader(req);
   if (!recebido || !iguaisSeguro(recebido, segredo)) {
     throw new ErroHttp(401, "não autorizado: mande o header Authorization: Bearer <PUBLICAR_SECRET>.");
   }
-  return segredo;
-}
-
-// ── Rascunho assinado (stateless) ─────────────────────────────────────────
-//
-// id = base64url(JSON do rascunho) + "." + base64url(HMAC-SHA256)
-//
-// A chave do HMAC é DERIVADA do PUBLICAR_SECRET (não é o segredo cru), pra o
-// mesmo valor não servir pra duas coisas. Trocar o PUBLICAR_SECRET invalida
-// todos os rascunhos em aberto, o que é o comportamento desejado.
-
-function chaveRascunho(segredo) {
-  return crypto.createHmac("sha256", segredo).update("manywata:rascunho:v1").digest();
-}
-
-function assinatura(corpo, segredo) {
-  return crypto.createHmac("sha256", chaveRascunho(segredo)).update(corpo).digest();
-}
-
-export function assinarRascunho(dados, segredo) {
-  const corpo = Buffer.from(JSON.stringify(dados), "utf8").toString("base64url");
-  return `${corpo}.${assinatura(corpo, segredo).toString("base64url")}`;
-}
-
-// Valida e abre o id. Ordem: formato (400) → assinatura (401) → conteúdo
-// (400) → validade (410). Nada aqui faz fetch.
-export function lerRascunho(id, segredo, agora = Date.now()) {
-  if (typeof id !== "string" || id.length > TAMANHO_MAX_ID || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(id)) {
-    throw new ErroHttp(400, "id de rascunho ausente ou malformado.");
-  }
-  const [corpo, sig] = id.split(".");
-
-  const esperado = assinatura(corpo, segredo);
-  const recebido = Buffer.from(sig, "base64url");
-  if (recebido.length !== esperado.length || !crypto.timingSafeEqual(recebido, esperado)) {
-    throw new ErroHttp(401, "id de rascunho com assinatura inválida (adulterado ou gerado com outro PUBLICAR_SECRET).");
-  }
-
-  let dados;
-  try {
-    dados = JSON.parse(Buffer.from(corpo, "base64url").toString("utf8"));
-  } catch {
-    throw new ErroHttp(400, "id de rascunho ilegível.");
-  }
-  const formatoOk =
-    dados?.v === 1 &&
-    typeof dados.conta === "string" &&
-    typeof dados.tipo === "string" &&
-    typeof dados.containerId === "string" &&
-    /^\d+$/.test(dados.containerId) &&
-    Array.isArray(dados.itens) &&
-    typeof dados.expiraEm === "string";
-  if (!formatoOk) throw new ErroHttp(400, "id de rascunho em formato desconhecido.");
-
-  // Date.parse inválido dá NaN, e NaN cai aqui como expirado (falha fechada).
-  if (!(agora <= Date.parse(dados.expiraEm))) {
-    throw new ErroHttp(410, "container expirado, gere outro rascunho (o Instagram descarta container não publicado em 24h).");
-  }
-  return dados;
 }
 
 // ── Sanitização ───────────────────────────────────────────────────────────
@@ -202,16 +133,4 @@ function hostNaoPublico(host) {
 
   // Nome sem ponto (ex.: "intranet") não é domínio público.
   return !host.includes(".");
-}
-
-// ── HTML ──────────────────────────────────────────────────────────────────
-
-export function escaparHtml(texto) {
-  return String(texto ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[c]);
 }

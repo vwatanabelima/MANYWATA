@@ -29,7 +29,7 @@ Project → Settings → Environment Variables. Veja `.env.example`.
 | `IG_APP_SECRET` | "Chave secreta do app" do painel Meta — valida o HMAC de todo webhook |
 | `IG_ACCESS_TOKEN` | token long-lived do @watanabe.ia |
 | `IG_ACCESS_TOKEN_ETERNIZA` | token long-lived do @eternizacards |
-| `PUBLICAR_SECRET` | senha das rotas de publicação de mídia (ver [Publicação de mídia](#publicação-de-mídia-rascunho--publicar)) |
+| `PUBLICAR_SECRET` | senha da rota de publicação de mídia (ver [Publicação de mídia](#publicação-de-mídia)) |
 
 🔴 Os tokens `IG_ACCESS_TOKEN*` são tipo **Encrypted**, nunca **Sensitive**: o cron `refresh-token.mjs` precisa ler o valor de volta pra renovar. O `PUBLICAR_SECRET` pode ser Sensitive.
 
@@ -69,7 +69,7 @@ npm test
 
 Cobre o cadastro de contas e o casamento de regras. Os testes de invariante existem pra pegar o pior bug possível aqui: duas contas apontando pro mesmo token, o que faria o DM de uma sair pela outra em silêncio.
 
-`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, validação, ordem das chamadas ao Graph, limite de 24h, id adulterado/expirado e que o token não aparece em resposta nem em log.
+`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log.
 
 ## Insights orgânicos
 
@@ -84,134 +84,136 @@ Lê o token do `.env.local` (ou do ambiente) pelo nome que está em `contas.js`.
 
 Se der 401: o cron rotacionou o token na Vercel, recopie pro `.env.local`.
 
-## Publicação de mídia (rascunho → publicar)
+## Publicação de mídia
 
-Publica no Instagram pela API oficial (Instagram API with Instagram Login), em **duas etapas separadas**. Hoje: **carrossel** da @eternizacards. Reels e Stories já têm lugar no desenho, mas respondem 501 (ver [o que falta](#o-que-falta-para-reels-e-stories)).
+Publica no Instagram pela API oficial (Instagram API with Instagram Login), **numa chamada só**. Hoje: **carrossel** da @eternizacards. Reels e Stories já têm lugar no desenho, mas respondem 501 (ver [o que falta](#o-que-falta-para-reels-e-stories)).
 
 ### Fluxo de negócio
 
 1. A especialista faz o briefing.
 2. O Programador monta o carrossel (`slide-01.jpg`, `slide-02.jpg`, ... + `instagram-post.txt` com a legenda).
-3. A especialista sobe os JPEGs numa URL pública e cria o **rascunho**. O Instagram recebe as imagens e monta o container, mas **nada aparece no perfil**.
-4. Ela manda o **link do preview** pro Vinicius.
-5. **Só com a confirmação do Vinicius** alguém roda o **publicar** (`confirmar: true` / `--confirmar`).
+3. **O Vinicius vê as imagens e o texto antes** (os próprios arquivos da pasta de render) e aprova.
+4. **Com o ok dele**, alguém roda o publicar (`confirmar: true` / `--confirmar`). A rota cria os containers e **posta direto**. Não tem rascunho nem preview do lado do servidor: o que for mandado é o que vai pro perfil.
 
-O rascunho vale **24h** (é o tempo que o Instagram guarda container não publicado). Passou disso, gere outro.
+⚠️ Publicar não tem volta pela API. Rode **uma vez**. Se der timeout ou falha de rede no meio, **confira o perfil antes de rodar de novo** (pode ter publicado).
 
 ### Endpoints
 
-Todos exigem `PUBLICAR_SECRET` configurado no servidor (sem ele: **503**, nenhuma chamada ao Instagram).
-
 | Rota | Método | Auth | O que faz |
 |------|--------|------|-----------|
-| `/api/midia/rascunho` | POST | `Authorization: Bearer <PUBLICAR_SECRET>` | valida, cria os containers e espera `FINISHED`. **Não publica.** Devolve `id` e `preview` |
-| `/api/midia/publicar` | POST | `Authorization: Bearer <PUBLICAR_SECRET>` | com `confirmar: true`: re-checa o container, checa o limite de 24h e publica. Devolve `permalink` |
-| `/api/midia/preview?id=...` | GET | o próprio `id` assinado (Bearer opcional) | página HTML com os slides e a legenda. Só leitura |
-| `/api/carrossel/rascunho` | POST | Bearer | alias de `/api/midia/rascunho` com `tipo` fixo `CAROUSEL` (pode omitir) |
-| `/api/carrossel/publicar` | POST | Bearer | alias de `/api/midia/publicar` que só aceita rascunho de carrossel |
+| `/api/midia/publicar` | POST | `Authorization: Bearer <PUBLICAR_SECRET>` | valida, checa o limite de 24h, cria os containers, espera `FINISHED`, publica e devolve o `permalink` |
+| `/api/carrossel/publicar` | POST | Bearer | alias com `tipo` fixo `CAROUSEL` (pode omitir; outro tipo → 400) |
 
-Os aliases existem porque eram 3 linhas cada; a rota "oficial" é `/api/midia/*`.
+Body:
 
-Respostas de erro são `{"erro": "..."}`: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer, Bearer errado ou id adulterado · **405** método errado · **409** container já publicado · **410** rascunho/container expirado · **429** limite de 24h atingido (nada publicado) · **501** tipo não implementado · **502** o Instagram recusou (mensagem do Meta, sem token) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo.
+```json
+{
+  "conta": "eterniza",
+  "tipo": "CAROUSEL",
+  "itens": [{"url": "https://..."}, {"url": "https://..."}],
+  "legenda": "...",
+  "confirmar": true
+}
+```
 
-**Por que o preview abre só com o id:** o id é assinado (HMAC-SHA256) com chave derivada do `PUBLICAR_SECRET` e só sai pra quem chamou o rascunho com o segredo. Ele mostra o que já carrega (URLs públicas + legenda), não chama o Instagram e não tem botão de publicar, então dá pra mandar o link por WhatsApp e abrir no celular. **Publicar sempre exige o Bearer**: o id sozinho não publica nada.
+`confirmar` tem que ser o booleano `true`: `"true"`, `1` ou ausente dá 400.
 
-### Exemplos (curl)
+Ordem do que a rota faz:
+
+1. **Sem tocar no Instagram:** método (405), `PUBLICAR_SECRET` configurado (503), Bearer (401), `confirmar` (400), tipo (400/501), conta (400), itens/URLs/legenda (400), token da conta (503). Qualquer recusa aqui = **zero** chamada ao Graph.
+2. `content_publishing_limit`: cota de 24h atingida → **429 sem criar nenhum container**.
+3. Um container-filho por slide, na ordem; espera cada um `FINISHED`.
+4. Container `CAROUSEL` com `children` na mesma ordem + `caption`; espera `FINISHED`.
+5. `media_publish`.
+6. Permalink. Se falhar aqui, o post **já está no ar**: volta **200 com `aviso`**, pra ninguém repetir achando que não foi.
+
+Resposta 200: `{"mediaId", "permalink", "username", "quota": {"usado", "total"}, "conta", "tipo"}` (+ `aviso` se o permalink falhou).
+
+Erros são `{"erro": "..."}`: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer ou Bearer errado · **405** método errado · **409** container já publicado · **410** container expirou no Instagram · **429** limite de 24h atingido (nada criado) · **501** tipo não implementado · **502** o Instagram recusou ou deu `ERROR` (mensagem do Meta, sem token; nada publicado) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo (nada publicado).
+
+Se der 502/504 em container, sobram containers órfãos no Instagram. Eles não aparecem no perfil e o Meta descarta em 24h.
+
+### Exemplo (curl)
 
 ```bash
-# rascunho
-curl -sX POST https://manywata.vercel.app/api/midia/rascunho \
+curl -sX POST https://manywata.vercel.app/api/midia/publicar \
   -H "Authorization: Bearer $PUBLICAR_SECRET" -H "Content-Type: application/json" \
   -d '{
     "conta": "eterniza",
     "tipo": "CAROUSEL",
     "itens": [{"url": "https://exemplo.com/c1/slide-01.jpg"}, {"url": "https://exemplo.com/c1/slide-02.jpg"}],
-    "legenda": "Sua carta, seu nome. #tcg"
+    "legenda": "Sua carta, seu nome. #tcg",
+    "confirmar": true
   }'
-# → 201 {"id": "eyJ2Ijox...", "preview": "https://manywata.vercel.app/api/midia/preview?id=...", "expiraEm": "...", ...}
-
-# publicar (só depois do OK do Vinicius)
-curl -sX POST https://manywata.vercel.app/api/midia/publicar \
-  -H "Authorization: Bearer $PUBLICAR_SECRET" -H "Content-Type: application/json" \
-  -d '{"id": "eyJ2Ijox...", "confirmar": true}'
-# → 200 {"publicado": true, "mediaId": "...", "permalink": "https://www.instagram.com/p/...", "quota": {"usado": 4, "total": 50}}
+# → 200 {"mediaId": "...", "permalink": "https://www.instagram.com/p/...", "username": "eternizacards", "quota": {"usado": 4, "total": 50}, ...}
 ```
 
 ### CLI
 
 ```bash
-# rascunho a partir da pasta de render (slide-NN.jpg em ordem numérica + instagram-post.txt)
-node scripts/midia.mjs rascunho carrossel/render --base-url https://exemplo.com/c1
-npm run midia:rascunho -- carrossel/render --base-url https://exemplo.com/c1 --conta eterniza
+# só com o ok do Vinicius nas imagens e no texto
+node scripts/midia.mjs publicar carrossel/render --base-url https://exemplo.com/c1 --confirmar
+npm run midia:publicar -- carrossel/render --base-url https://exemplo.com/c1 --confirmar --conta eterniza
 
-# ou com a lista de URLs pronta
-node scripts/midia.mjs rascunho --urls https://exemplo.com/a.jpg,https://exemplo.com/b.jpg --legenda post.txt
-
-# conferir sem chamar nada
-node scripts/midia.mjs rascunho carrossel/render --base-url https://exemplo.com/c1 --dry-run
-
-# publicar (sem --confirmar ele recusa)
-node scripts/midia.mjs publicar <id> --confirmar
-
-# reimprimir o link do preview
-node scripts/midia.mjs preview <id>
+# conferir o que seria mandado, sem chamar nada
+node scripts/midia.mjs publicar carrossel/render --base-url https://exemplo.com/c1 --confirmar --dry-run
 ```
 
-`--base-url` é obrigatório porque quem baixa as imagens é o servidor do Meta: elas precisam estar numa URL **https pública** antes do rascunho, e o CLI ainda não faz upload (ver pendência abaixo). Os nomes dos arquivos são anexados à `--base-url`.
+- Lê `slide-NN.jpg` da pasta em ordem numérica (`slide-2` antes de `slide-10`) e a legenda de `instagram-post.txt` na mesma pasta.
+- Monta as URLs como `<--base-url>/<nome-do-arquivo>`, então os JPEGs precisam já estar publicados nesse endereço (ver [hospedagem](#hospedagem-das-imagens)).
+- **Sem `--confirmar` ele recusa**, inclusive com `--dry-run`.
+- `--conta` padrão: `eterniza`.
+- Lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`. Nunca imprime o segredo.
 
-O CLI lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`.
+### Hospedagem das imagens
 
-### Envs novas (criar na Vercel)
+Quem baixa as imagens é o **servidor do Meta**, não a rota. Então cada slide precisa estar numa **URL https pública**, acessível de fora sem login, e ser **JPEG**. A rota recusa `http`, `localhost`, IP privado e extensão que não seja `.jpg`/`.jpeg`. Se a URL não abrir de fora, o Meta devolve status `ERROR` e a rota responde 502 sem publicar.
+
+**Hospedagem: ver decisão no PR.**
+
+### Envs
 
 | Var | Onde | Tipo | Observação |
 |-----|------|------|------------|
-| `PUBLICAR_SECRET` | Vercel (production) + `.env.local` de quem usa o CLI | **Sensitive** serve, ninguém precisa ler de volta | mínimo 32 caracteres: `openssl rand -hex 32`. Trocar o valor invalida todos os rascunhos em aberto |
+| `PUBLICAR_SECRET` | **a criar**: Vercel (production) + `.env.local` de quem usa o CLI | **Sensitive** serve, ninguém precisa ler de volta | mínimo 32 caracteres: `openssl rand -hex 32`. Sem ela a rota responde 503 |
+| `IG_ACCESS_TOKEN_ETERNIZA` | já existe, **só no target production** | Encrypted | em deploy de preview a rota responde 503 ("token não configurado"), então **preview da Vercel não publica**. Pra testar de ponta a ponta tem que ser em produção |
 | `MANYWATA_URL` | só `.env.local` (CLI) | — | opcional |
 
 Depois de criar: **`vercel --prod` de novo**.
 
-⚠️ `IG_ACCESS_TOKEN_ETERNIZA` hoje existe **só no target production**. Em deploy de preview as rotas respondem 503 ("token não configurado"), então **preview da Vercel não publica**. Isso é bom, mas quer dizer que pra testar de ponta a ponta tem que ser em produção.
-
 ### Limites do Meta (regra deles, não do código)
 
-- **50 posts publicados via API por conta a cada 24h**. A rota checa `content_publishing_limit` antes de publicar e devolve 429 sem publicar se a cota acabou.
-- Container não publicado **expira em 24h**. O id do rascunho expira junto (410).
+- **50 posts publicados via API por conta a cada 24h**. A rota checa `content_publishing_limit` antes de criar qualquer container e devolve 429 se a cota acabou.
 - Carrossel: **2 a 10 itens**, imagens **JPEG** em URL pública. Mais de 10 o Meta recusa.
 - Legenda: até **2200 caracteres**, **30 hashtags** e **20 menções (@)**.
 - A conta precisa ser profissional (Business/Creator), e o token precisa da permissão `instagram_business_content_publish`.
 
 ### Como funciona por dentro
 
-- `api/_lib/` não vira rota na Vercel (prefixo `_`). Lá ficam `seguranca.js` (auth, id assinado, sanitização, validação de URL), `instagram-publicacao.js` (cliente do Graph + registro `TIPOS`) e `rotas-midia.js` (as três rotas).
-- **Sem banco nem store**: o id do rascunho é `base64url(JSON) + "." + HMAC-SHA256`, com conta, tipo, id do container, URLs, legenda e validade. Assinatura conferida com `timingSafeEqual`; expirado dá 410 sem chamar o Instagram. Como a legenda vai dentro do id, o link do preview fica comprido (alguns KB). Funciona, mas tem cara feia.
-- Carrossel: cria um container-filho por slide (`is_carousel_item=true`, `image_url`), espera cada um ficar `FINISHED`, cria o container `CAROUSEL` com `children` na mesma ordem e `caption`, e espera `FINISHED`. Orçamento de ~50s (a função tem 60s, ver `vercel.json`).
-- O token vai no header `Authorization: Bearer`, nunca na URL. Toda mensagem de erro passa por `sanitizar()`, que tira `access_token=`, `Bearer ...` e os segredos conhecidos.
-- Se o permalink falhar **depois** de publicar, a rota devolve 200 com `aviso`, pra ninguém tentar de novo achando que não foi.
-
-### Pendência: Vercel Blob
-
-O projeto ainda não tem Vercel Blob, então só entra URL pública pronta. Ponto de extensão documentado em `scripts/midia.mjs` (`montarItens`): com `BLOB_READ_WRITE_TOKEN` configurado, o CLI faz `put()` de cada slide no Blob e usa a URL devolvida. As rotas não mudam, continuam recebendo URL pública. Não tem dependência instalada pra isso ainda (`@vercel/blob` entra junto).
+- `api/_lib/` não vira rota na Vercel (prefixo `_`). Lá ficam `seguranca.js` (auth, sanitização, validação de URL), `instagram-publicacao.js` (cliente do Graph com `fetch`/`sleep`/`now` injetáveis + registro `TIPOS`) e `rotas-midia.js` (a rota).
+- **Sem banco nem store**: cada chamada é independente.
+- Tempo: a função tem 60s (`vercel.json`). Os containers têm até ~45s; o resto fica pro `media_publish` e o permalink. Imagem costuma ficar `FINISHED` na hora.
+- O token vai no header `Authorization: Bearer`, nunca na URL. Toda mensagem de erro e de log passa por `sanitizar()`, que tira `access_token=`, `Bearer ...` e os segredos conhecidos.
 
 ### O que falta para Reels e Stories
 
-O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `REELS` e `STORIES` com `implementado: false` (as rotas respondem 501). Pra ligar cada uma:
+O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `REELS` e `STORIES` com `implementado: false` (a rota responde 501). Pra ligar cada uma:
 
 **Reels**
 1. `validar()`: exatamente 1 item com URL https de vídeo (MP4/MOV; checar extensão), legenda com `validarLegenda`, `cover_url` opcional (JPEG público, via `validarUrlPublica`), `share_to_feed` opcional (booleano estrito).
 2. `criarContainers()`: `criarContainer({ media_type: "REELS", video_url, caption, cover_url?, share_to_feed? })`.
-3. **Tempo**: vídeo leva minutos pra ficar `FINISHED`, não cabe em 60s. Precisa de um estado "processando": o rascunho devolve o id já assinado com o container `IN_PROGRESS`, e um `GET /api/midia/status?id=...` (novo) faz uma checagem só. O `publicar` já re-checa `FINISHED` antes de publicar, então ele continua seguro.
-4. Preview: a página já troca `<img>` por `<video>` quando a URL termina em `.mp4`/`.mov`. Mostrar a capa (`cover_url`) se vier.
-5. Limites do Meta (duração, proporção recomendada 9:16, tamanho do arquivo): conferir na doc de Content Publishing na hora de implementar. Pela URL não dá pra checar; documentar e deixar o `status` `ERROR` do Meta explicar.
-6. Testes: os mesmos do carrossel trocando os params + o fluxo "processando → status → publicar".
+3. **Tempo**: vídeo leva minutos pra ficar `FINISHED`, não cabe em 60s. Vai precisar dividir em duas chamadas (uma cria o container e devolve o id, outra checa o status e publica quando estiver `FINISHED`), mantendo `confirmar: true` e a checagem de cota antes de criar.
+4. Limites do Meta (duração, proporção recomendada 9:16, tamanho do arquivo): conferir na doc de Content Publishing na hora de implementar. Pela URL não dá pra checar; documentar e deixar o `status` `ERROR` do Meta explicar.
+5. Hospedagem: vídeo pesa bem mais que JPEG; vale revisar a decisão de hospedagem pra vídeo.
+6. Testes: os mesmos do carrossel trocando os params + o fluxo em duas chamadas.
 
 **Stories**
 1. `validar()`: 1 item com `image_url` (JPEG) **ou** `video_url` (MP4/MOV), nunca os dois. **Sem legenda**: Stories não têm caption, então recusar `legenda` com 400 pra ninguém achar que ela vai aparecer.
 2. `criarContainers()`: `criarContainer({ media_type: "STORIES", image_url | video_url })`.
-3. Vídeo tem o mesmo problema de tempo do Reels (reusar o `GET status`).
-4. Preview em proporção 9:16 em vez de 4:5.
-5. Conferir na doc se Stories contam no limite de 50/24h. O `publicar` checa a cota de qualquer jeito.
+3. Imagem cabe no fluxo de uma chamada. Vídeo tem o mesmo problema de tempo do Reels.
+4. Conferir na doc se Stories contam no limite de 50/24h. A rota checa a cota de qualquer jeito.
 
-Os dois exigem a mesma permissão do carrossel. O resto (auth, id assinado, limite, sanitização, publicar) já é genérico.
+Os dois exigem a mesma permissão do carrossel. O resto (auth, `confirmar`, limite, sanitização, publish, permalink) já é genérico.
 
 ## Renovação de token
 

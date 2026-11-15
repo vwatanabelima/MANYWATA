@@ -1,30 +1,21 @@
-// CLI da especialista pra publicar mídia em duas etapas: rascunho → publicar.
-// Fala com as rotas /api/midia/* do MANYWATA (não com o Instagram direto).
+// CLI pra publicar um carrossel aprovado. Fala com POST /api/midia/publicar
+// do MANYWATA (não com o Instagram direto).
 //
 // Uso:
-//   node scripts/midia.mjs rascunho <pasta-render> --base-url <url-publica> [--conta eterniza]
-//   node scripts/midia.mjs rascunho --urls <url1,url2,...> --legenda <arquivo.txt> [--conta eterniza]
-//   node scripts/midia.mjs publicar <id> --confirmar
-//   node scripts/midia.mjs preview <id>
+//   node scripts/midia.mjs publicar <pasta-render> --base-url <url-https-pública> --confirmar [--conta eterniza] [--dry-run]
 //
-// Opções:
-//   --conta <slug>       conta de api/contas.js (padrão: eterniza)
-//   --tipo <TIPO>        padrão CAROUSEL (REELS/STORIES ainda dão 501)
-//   --legenda <arquivo>  padrão: <pasta-render>/instagram-post.txt
-//   --dry-run            mostra o que mandaria e não chama nada
+// Só rode com o ok do Vinicius nas imagens e no texto: a chamada publica
+// direto, não tem rascunho. Sem --confirmar o CLI recusa.
 //
 // A pasta de render tem slide-01.jpg, slide-02.jpg, ... (ordem numérica,
 // slide-2 antes de slide-10) e instagram-post.txt com a legenda.
 //
-// Por que --base-url é obrigatório: quem baixa as imagens é o servidor do
-// Meta, então elas precisam estar numa URL https pública ANTES do rascunho.
-// Este CLI ainda não faz upload (Vercel Blob pendente). Suba os JPEGs pra
-// algum lugar público e passe a URL da pasta em --base-url (os nomes dos
-// arquivos são anexados nela), ou passe a lista inteira em --urls.
+// --base-url: quem baixa as imagens é o servidor do Meta, então os mesmos
+// JPEGs da pasta precisam já estar numa URL https pública. Os nomes dos
+// arquivos são anexados nela (base/slide-01.jpg, ...). Este CLI não faz
+// upload.
 //
-// PONTO DE EXTENSÃO (Vercel Blob): quando existir BLOB_READ_WRITE_TOKEN, o
-// upload entra em montarItens(): put() de cada slide no Blob e usa a URL
-// devolvida. As rotas não mudam, continuam recebendo URL pública.
+// --dry-run: mostra o que mandaria e não chama nada.
 //
 // Lê PUBLICAR_SECRET e MANYWATA_URL do ambiente ou do .env.local. Nunca
 // imprime o segredo.
@@ -35,8 +26,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const URL_PADRAO = "https://manywata.vercel.app";
+const ROTA = "/api/midia/publicar";
+const USO =
+  "Uso: node scripts/midia.mjs publicar <pasta-render> --base-url <url-https-pública> --confirmar [--conta eterniza] [--dry-run]";
 
-// ── Partes puras (testadas em tests/midia.test.js) ────────────────────────
+// ── Partes puras ──────────────────────────────────────────────────────────
 
 // slide-NN.jpg em ordem numérica (slide-2 antes de slide-10).
 export function listarSlides(pasta) {
@@ -62,7 +56,7 @@ export function montarUrls(baseUrl, arquivos) {
 // ── Config ────────────────────────────────────────────────────────────────
 
 let envLocal = null;
-function lerVar(nome) {
+function lerVarPadrao(nome) {
   if (process.env[nome]) return process.env[nome].trim();
   if (envLocal === null) {
     try {
@@ -75,131 +69,103 @@ function lerVar(nome) {
   return linha ? linha.slice(nome.length + 1).trim().replace(/^["']|["']$/g, "") : undefined;
 }
 
-function sair(msg) {
-  console.error(msg);
-  process.exit(1);
-}
+// ── Comando ───────────────────────────────────────────────────────────────
 
-// ── Comandos ──────────────────────────────────────────────────────────────
-
-function montarItens({ pasta, baseUrl, urls }) {
-  if (urls) return urls.split(",").map((u) => u.trim()).filter(Boolean);
-  if (!pasta) sair("Falta a pasta de render (ou --urls).");
-  const slides = listarSlides(pasta);
-  if (!slides.length) sair(`Nenhum slide-NN.jpg em ${pasta}.`);
-  if (!baseUrl) {
-    sair(
-      [
-        "Falta --base-url.",
-        "O Instagram baixa as imagens de uma URL https pública; este CLI ainda não faz upload",
-        "(Vercel Blob está pendente). Suba os JPEGs abaixo pra uma pasta pública e rode de novo com",
-        "--base-url <url-da-pasta>, ou passe --urls <url1,url2,...>:",
-        ...slides.map((s) => `  ${s}`),
-      ].join("\n")
-    );
-  }
-  return montarUrls(baseUrl, slides);
-}
-
-function lerLegenda({ pasta, arquivoLegenda }) {
-  const caminho = arquivoLegenda || (pasta && join(pasta, "instagram-post.txt"));
-  if (!caminho) sair("Falta a legenda: passe --legenda <arquivo.txt>.");
-  try {
-    return readFileSync(caminho, "utf8");
-  } catch {
-    return sair(`Não achei a legenda em ${caminho} (use --legenda <arquivo.txt>).`);
-  }
-}
-
-async function chamar(rota, corpo, { dryRun }) {
-  const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
-  if (dryRun) {
-    console.log(`[dry-run] POST ${base}${rota}`);
-    console.log(JSON.stringify(corpo, null, 2));
-    return null;
-  }
-  const segredo = lerVar("PUBLICAR_SECRET");
-  if (!segredo) sair("PUBLICAR_SECRET não achado no ambiente nem no .env.local.");
-
-  let r;
-  try {
-    r = await fetch(`${base}${rota}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${segredo}`, "Content-Type": "application/json" },
-      body: JSON.stringify(corpo),
-    });
-  } catch (e) {
-    sair(`Falha de rede chamando ${base}${rota}: ${e.message}`);
-  }
-  const dados = await r.json().catch(() => ({}));
-  if (!r.ok) sair(`HTTP ${r.status}: ${dados.erro || "sem detalhe"}`);
-  return dados;
-}
-
-async function rascunho(args, opt) {
-  const pasta = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
-  const itens = montarItens({ pasta, baseUrl: opt("--base-url"), urls: opt("--urls") });
-  const legenda = lerLegenda({ pasta, arquivoLegenda: opt("--legenda") });
-  const corpo = {
-    conta: opt("--conta") || "eterniza",
-    tipo: (opt("--tipo") || "CAROUSEL").toUpperCase(),
-    itens: itens.map((url) => ({ url })),
-    legenda,
-  };
-  console.log(`Criando rascunho ${corpo.tipo} (${itens.length} itens) para "${corpo.conta}"... pode levar até ~1 min.`);
-  const r = await chamar("/api/midia/rascunho", corpo, { dryRun: opt.flag("--dry-run") });
-  if (!r) return;
-  console.log("\nRascunho pronto. NADA foi publicado.");
-  console.log(`  id:      ${r.id}`);
-  console.log(`  preview: ${r.preview}`);
-  console.log(`  expira:  ${r.expiraEm}`);
-  console.log("\nMande o preview pro Vinicius. Só depois do OK:");
-  console.log(`  node scripts/midia.mjs publicar ${r.id} --confirmar`);
-}
-
-async function publicar(args, opt) {
-  const id = args[0];
-  if (!id || id.startsWith("--")) sair("Uso: node scripts/midia.mjs publicar <id> --confirmar");
-  if (!opt.flag("--confirmar")) {
-    sair("Recusado: publicar exige --confirmar. Só rode com o OK explícito do Vinicius.");
-  }
-  const r = await chamar("/api/midia/publicar", { id, confirmar: true }, { dryRun: opt.flag("--dry-run") });
-  if (!r) return;
-  console.log(`Publicado em @${r.username}: ${r.permalink || "(permalink indisponível)"}`);
-  console.log(`  media_id: ${r.mediaId}  ·  cota 24h: ${r.quota.usado}/${r.quota.total}`);
-  if (r.aviso) console.log(`  aviso: ${r.aviso}`);
-}
-
-function preview(args) {
-  const id = args[0];
-  if (!id) sair("Uso: node scripts/midia.mjs preview <id>");
-  const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
-  console.log(`${base}/api/midia/preview?id=${encodeURIComponent(id)}`);
-}
-
-async function main(argv) {
+// Lança Error com a mensagem pro usuário; o bootstrap lá embaixo imprime e
+// sai com 1. Injeção (fetch, lerVar, log) é pros testes.
+export async function executar(argv, { fetch = globalThis.fetch, lerVar = lerVarPadrao, log = console.log } = {}) {
   const [comando, ...resto] = argv;
   const opt = (flag) => {
     const i = resto.indexOf(flag);
     return i >= 0 && resto[i + 1] && !resto[i + 1].startsWith("--") ? resto[i + 1] : undefined;
   };
-  opt.flag = (flag) => resto.includes(flag);
+  const tem = (flag) => resto.includes(flag);
 
-  if (comando === "rascunho") return rascunho(resto, opt);
-  if (comando === "publicar") return publicar(resto, opt);
-  if (comando === "preview") return preview(resto);
-  sair(
-    [
-      "Uso:",
-      "  node scripts/midia.mjs rascunho <pasta-render> --base-url <url-publica> [--conta eterniza]",
-      "  node scripts/midia.mjs rascunho --urls <url1,url2,...> --legenda <arquivo.txt>",
-      "  node scripts/midia.mjs publicar <id> --confirmar",
-      "  node scripts/midia.mjs preview <id>",
-    ].join("\n")
-  );
+  if (comando !== "publicar") throw new Error(USO);
+  if (!tem("--confirmar")) {
+    throw new Error("Recusado: publicar exige --confirmar. Só rode com o ok do Vinicius nas imagens e no texto.");
+  }
+
+  const pasta = resto[0] && !resto[0].startsWith("--") ? resto[0] : undefined;
+  if (!pasta) throw new Error(`Falta a pasta de render.\n${USO}`);
+  let slides;
+  try {
+    slides = listarSlides(pasta);
+  } catch {
+    throw new Error(`Não consegui ler a pasta ${pasta}.`);
+  }
+  if (!slides.length) throw new Error(`Nenhum slide-NN.jpg em ${pasta}.`);
+
+  const baseUrl = opt("--base-url");
+  if (!baseUrl) {
+    throw new Error(
+      [
+        "Falta --base-url.",
+        "O Instagram baixa as imagens de uma URL https pública; este CLI não faz upload.",
+        "Deixe estes JPEGs numa pasta pública e passe a URL dela em --base-url:",
+        ...slides.map((s) => `  ${s}`),
+      ].join("\n")
+    );
+  }
+  const itens = montarUrls(baseUrl, slides);
+
+  const arquivoLegenda = join(pasta, "instagram-post.txt");
+  let legenda;
+  try {
+    legenda = readFileSync(arquivoLegenda, "utf8");
+  } catch {
+    throw new Error(`Não achei a legenda em ${arquivoLegenda}.`);
+  }
+
+  const corpo = {
+    conta: opt("--conta") || "eterniza",
+    tipo: "CAROUSEL",
+    itens: itens.map((url) => ({ url })),
+    legenda,
+    confirmar: true,
+  };
+  const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
+
+  if (tem("--dry-run")) {
+    log(`[dry-run] POST ${base}${ROTA}  (nada foi enviado)`);
+    log(JSON.stringify(corpo, null, 2));
+    return null;
+  }
+
+  const segredo = lerVar("PUBLICAR_SECRET");
+  if (!segredo) throw new Error("PUBLICAR_SECRET não achado no ambiente nem no .env.local.");
+
+  log(`Publicando carrossel (${itens.length} slides) em "${corpo.conta}"... pode levar até ~1 min.`);
+  let r;
+  try {
+    r = await fetch(`${base}${ROTA}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${segredo}`, "Content-Type": "application/json" },
+      body: JSON.stringify(corpo),
+    });
+  } catch (e) {
+    throw new Error(
+      `Falha de rede chamando ${base}${ROTA}: ${e.message}\nPode ter publicado mesmo assim: confira o perfil ANTES de rodar de novo.`
+    );
+  }
+  const dados = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const extra = dados.erro ? "" : "\nResposta sem detalhe (timeout da Vercel?): confira o perfil ANTES de rodar de novo.";
+    throw new Error(`HTTP ${r.status}: ${dados.erro || "sem detalhe"}${extra}`);
+  }
+
+  log(`Publicado em @${dados.username}: ${dados.permalink || "(permalink indisponível)"}`);
+  log(`  media_id: ${dados.mediaId}  ·  cota 24h: ${dados.quota?.usado}/${dados.quota?.total}`);
+  if (dados.aviso) log(`  aviso: ${dados.aviso}`);
+  return dados;
 }
 
-// Só roda como CLI; importado (testes) só expõe as funções puras.
+// Só roda como CLI; importado (testes) só expõe as funções.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  await main(process.argv.slice(2));
+  try {
+    await executar(process.argv.slice(2));
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
 }
