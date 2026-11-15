@@ -2,7 +2,7 @@
 // do MANYWATA (não com o Instagram direto).
 //
 // Uso:
-//   node scripts/midia.mjs publicar <pasta-render> --base-url <url-https-pública> --confirmar [--conta eterniza] [--dry-run]
+//   node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
 //
 // Só rode com o ok do Vinicius nas imagens e no texto: a chamada publica
 // direto, não tem rascunho. Sem --confirmar o CLI recusa.
@@ -10,25 +10,42 @@
 // A pasta de render tem slide-01.jpg, slide-02.jpg, ... (ordem numérica,
 // slide-2 antes de slide-10) e instagram-post.txt com a legenda.
 //
-// --base-url: quem baixa as imagens é o servidor do Meta, então os mesmos
-// JPEGs da pasta precisam já estar numa URL https pública. Os nomes dos
-// arquivos são anexados nela (base/slide-01.jpg, ...). Este CLI não faz
-// upload.
+// Quem baixa as imagens é o servidor do Meta, então elas precisam estar numa
+// URL https pública:
+//   - sem --base-url (padrão): sobe os JPEGs pro Supabase Storage (bucket
+//     público instagram-temp do eternizacards), publica e apaga. Precisa de
+//     SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no ambiente (nunca do
+//     .env.local): set -a; . /home/box/.secrets/supabase-eterniza.env; set +a
+//   - com --base-url: os JPEGs já estão nessa URL (base/slide-01.jpg, ...);
+//     não sobe nem apaga nada.
 //
-// --dry-run: mostra o que mandaria e não chama nada.
+// --dry-run: mostra o que mandaria (e os caminhos no Storage) e não chama nada.
 //
 // Lê PUBLICAR_SECRET e MANYWATA_URL do ambiente ou do .env.local. Nunca
-// imprime o segredo.
+// imprime segredo nem chave.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { sanitizar } from "../api/_lib/seguranca.js";
+import {
+  BUCKET,
+  apagarDoStorage,
+  carimbo,
+  enviarParaStorage,
+  lerCredenciaisStorage,
+  lerSlidesJpeg,
+  montarCaminhos,
+  slugDaPasta,
+  urlPublica,
+} from "./_storage.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const URL_PADRAO = "https://manywata.vercel.app";
 const ROTA = "/api/midia/publicar";
 const USO =
-  "Uso: node scripts/midia.mjs publicar <pasta-render> --base-url <url-https-pública> --confirmar [--conta eterniza] [--dry-run]";
+  "Uso: node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]";
+const CONFERIR = "confira o perfil ANTES de rodar de novo.";
 
 // ── Partes puras ──────────────────────────────────────────────────────────
 
@@ -72,8 +89,20 @@ function lerVarPadrao(nome) {
 // ── Comando ───────────────────────────────────────────────────────────────
 
 // Lança Error com a mensagem pro usuário; o bootstrap lá embaixo imprime e
-// sai com 1. Injeção (fetch, lerVar, log) é pros testes.
-export async function executar(argv, { fetch = globalThis.fetch, lerVar = lerVarPadrao, log = console.log } = {}) {
+// sai com 1. Injeção (fetch, lerVar, env, log, avisar, agora, sufixo) é pros
+// testes. SUPABASE_* vêm só de `env` (process.env), nunca do .env.local.
+export async function executar(
+  argv,
+  {
+    fetch = globalThis.fetch,
+    lerVar = lerVarPadrao,
+    env = process.env,
+    log = console.log,
+    avisar = console.warn,
+    agora = () => new Date(),
+    sufixo,
+  } = {}
+) {
   const [comando, ...resto] = argv;
   const opt = (flag) => {
     const i = resto.indexOf(flag);
@@ -96,19 +125,7 @@ export async function executar(argv, { fetch = globalThis.fetch, lerVar = lerVar
   }
   if (!slides.length) throw new Error(`Nenhum slide-NN.jpg em ${pasta}.`);
 
-  const baseUrl = opt("--base-url");
-  if (!baseUrl) {
-    throw new Error(
-      [
-        "Falta --base-url.",
-        "O Instagram baixa as imagens de uma URL https pública; este CLI não faz upload.",
-        "Deixe estes JPEGs numa pasta pública e passe a URL dela em --base-url:",
-        ...slides.map((s) => `  ${s}`),
-      ].join("\n")
-    );
-  }
-  const itens = montarUrls(baseUrl, slides);
-
+  // Legenda antes de qualquer upload.
   const arquivoLegenda = join(pasta, "instagram-post.txt");
   let legenda;
   try {
@@ -117,25 +134,102 @@ export async function executar(argv, { fetch = globalThis.fetch, lerVar = lerVar
     throw new Error(`Não achei a legenda em ${arquivoLegenda}.`);
   }
 
-  const corpo = {
-    conta: opt("--conta") || "eterniza",
-    tipo: "CAROUSEL",
-    itens: itens.map((url) => ({ url })),
-    legenda,
-    confirmar: true,
-  };
+  const conta = opt("--conta") || "eterniza";
+  const corpo = (urls) => ({ conta, tipo: "CAROUSEL", itens: urls.map((url) => ({ url })), legenda, confirmar: true });
   const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
-
-  if (tem("--dry-run")) {
+  const dryRun = tem("--dry-run");
+  const mostrarDryRun = (c) => {
     log(`[dry-run] POST ${base}${ROTA}  (nada foi enviado)`);
-    log(JSON.stringify(corpo, null, 2));
+    log(JSON.stringify(c, null, 2));
+  };
+
+  // ── Com --base-url: as imagens já estão públicas, nada de Storage ──
+  const baseUrl = opt("--base-url");
+  if (baseUrl) {
+    const c = corpo(montarUrls(baseUrl, slides));
+    if (dryRun) {
+      mostrarDryRun(c);
+      return null;
+    }
+    return chamarRota({ fetch, base, segredo: exigirSegredo(lerVar), corpo: c, log });
+  }
+
+  // ── Sem --base-url: sobe pro Supabase Storage, publica, apaga ──
+  // Tudo que pode recusar sem rede vem antes do primeiro upload. Dry-run não
+  // exige credencial (só avisa lá embaixo).
+  const cred = dryRun ? null : lerCredenciaisStorage(env);
+  const segredo = dryRun ? null : exigirSegredo(lerVar);
+  if (slides.length < 2 || slides.length > 10) {
+    throw new Error(`Carrossel precisa de 2 a 10 slides; achei ${slides.length} em ${pasta}. Nada foi enviado.`);
+  }
+  const arquivos = lerSlidesJpeg(pasta, slides);
+  const prefixo = `${slugDaPasta(pasta)}-${carimbo(agora(), sufixo)}`;
+  const caminhos = montarCaminhos(prefixo, slides);
+
+  if (dryRun) {
+    let credDry = null;
+    try {
+      credDry = lerCredenciaisStorage(env);
+    } catch {
+      // só avisa
+    }
+    log(`[dry-run] subiria ${caminhos.length} JPEG(s) pro Supabase Storage (nada foi enviado):`);
+    for (const c of caminhos) log(`  ${BUCKET}/${c}`);
+    if (!credDry) {
+      log("  aviso: SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY ausentes ou inválidas no ambiente; o publicar de verdade vai recusar.");
+    }
+    mostrarDryRun(corpo(caminhos.map((c) => urlPublica(credDry?.url ?? "<SUPABASE_URL>", c))));
+    log(`[dry-run] depois de publicar, apagaria ${BUCKET}/${prefixo}/`);
     return null;
   }
 
+  const limpo = (texto) => sanitizar(texto, [cred.chave, segredo]);
+
+  let enviados = [];
+  try {
+    log(`Subindo ${arquivos.length} JPEG(s) para ${BUCKET}/${prefixo}/ ...`);
+    let urls;
+    try {
+      ({ caminhos: enviados, urls } = await enviarParaStorage({ arquivos, prefixo, cred, fetch }));
+    } catch (e) {
+      enviados = e.caminhos ?? [];
+      throw new Error(`${e.message}\nNada foi publicado.`);
+    }
+    return await chamarRota({ fetch, base, segredo, corpo: corpo(urls), log });
+  } catch (e) {
+    throw new Error(limpo(e?.message));
+  } finally {
+    // Sempre apaga, inclusive quando o resultado da publicação é incerto: o
+    // Meta baixa as imagens ao criar os containers. Se apagar no meio de uma
+    // publicação ainda em andamento, o pior caso é o container dar ERROR e
+    // nada ir pro ar (as mensagens de erro incerto já mandam conferir o perfil).
+    if (enviados.length) {
+      try {
+        await apagarDoStorage({ caminhos: enviados, cred, fetch });
+        log(`Temporários apagados de ${BUCKET}/${prefixo}/.`);
+      } catch (e) {
+        avisar(
+          limpo(
+            [
+              `aviso: não consegui apagar os temporários do Storage (${e?.message}).`,
+              "Apague à mão no painel do Supabase (Storage → instagram-temp):",
+              ...enviados.map((c) => `  ${BUCKET}/${c}`),
+            ].join("\n")
+          )
+        );
+      }
+    }
+  }
+}
+
+function exigirSegredo(lerVar) {
   const segredo = lerVar("PUBLICAR_SECRET");
   if (!segredo) throw new Error("PUBLICAR_SECRET não achado no ambiente nem no .env.local.");
+  return segredo;
+}
 
-  log(`Publicando carrossel (${itens.length} slides) em "${corpo.conta}"... pode levar até ~1 min.`);
+async function chamarRota({ fetch, base, segredo, corpo, log }) {
+  log(`Publicando carrossel (${corpo.itens.length} slides) em "${corpo.conta}"... pode levar até ~1 min.`);
   let r;
   try {
     r = await fetch(`${base}${ROTA}`, {
@@ -144,13 +238,11 @@ export async function executar(argv, { fetch = globalThis.fetch, lerVar = lerVar
       body: JSON.stringify(corpo),
     });
   } catch (e) {
-    throw new Error(
-      `Falha de rede chamando ${base}${ROTA}: ${e.message}\nPode ter publicado mesmo assim: confira o perfil ANTES de rodar de novo.`
-    );
+    throw new Error(`Falha de rede chamando ${base}${ROTA}: ${e.message}\nPode ter publicado mesmo assim: ${CONFERIR}`);
   }
   const dados = await r.json().catch(() => ({}));
   if (!r.ok) {
-    const extra = dados.erro ? "" : "\nResposta sem detalhe (timeout da Vercel?): confira o perfil ANTES de rodar de novo.";
+    const extra = dados.erro ? "" : `\nResposta sem detalhe (timeout da Vercel?): pode ter publicado, ${CONFERIR}`;
     throw new Error(`HTTP ${r.status}: ${dados.erro || "sem detalhe"}${extra}`);
   }
 

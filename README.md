@@ -69,7 +69,7 @@ npm test
 
 Cobre o cadastro de contas e o casamento de regras. Os testes de invariante existem pra pegar o pior bug possível aqui: duas contas apontando pro mesmo token, o que faria o DM de uma sair pela outra em silêncio.
 
-`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log.
+`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza depois de sucesso, de erro da rota e de upload parcial, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro.
 
 ## Insights orgânicos
 
@@ -151,25 +151,56 @@ curl -sX POST https://manywata.vercel.app/api/midia/publicar \
 ### CLI
 
 ```bash
-# só com o ok do Vinicius nas imagens e no texto
-node scripts/midia.mjs publicar carrossel/render --base-url https://exemplo.com/c1 --confirmar
-npm run midia:publicar -- carrossel/render --base-url https://exemplo.com/c1 --confirmar --conta eterniza
+# 1. credenciais do Storage, do arquivo protegido (só no terminal do operador)
+set -a; . /home/box/.secrets/supabase-eterniza.env; set +a
 
-# conferir o que seria mandado, sem chamar nada
-node scripts/midia.mjs publicar carrossel/render --base-url https://exemplo.com/c1 --confirmar --dry-run
+# 2. conferir o que seria feito, sem subir nem chamar nada
+node scripts/midia.mjs publicar carrossel/drop-natal/render --confirmar --dry-run
+
+# 3. só com o ok do Vinicius nas imagens e no texto
+node scripts/midia.mjs publicar carrossel/drop-natal/render --confirmar
+npm run midia:publicar -- carrossel/drop-natal/render --confirmar --conta eterniza
+
+# alternativa: imagens já publicadas em outro lugar (não sobe nem apaga nada)
+node scripts/midia.mjs publicar carrossel/drop-natal/render --base-url https://exemplo.com/c1 --confirmar
 ```
 
 - Lê `slide-NN.jpg` da pasta em ordem numérica (`slide-2` antes de `slide-10`) e a legenda de `instagram-post.txt` na mesma pasta.
-- Monta as URLs como `<--base-url>/<nome-do-arquivo>`, então os JPEGs precisam já estar publicados nesse endereço (ver [hospedagem](#hospedagem-das-imagens)).
 - **Sem `--confirmar` ele recusa**, inclusive com `--dry-run`.
 - `--conta` padrão: `eterniza`.
-- Lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`. Nunca imprime o segredo.
+- **Sem `--base-url`** (padrão): sobe os JPEGs pro Supabase Storage, publica e apaga (ver [hospedagem](#hospedagem-das-imagens)).
+- **Com `--base-url`**: monta as URLs como `<--base-url>/<nome-do-arquivo>`; os JPEGs precisam já estar nesse endereço. Não toca no Storage e não precisa das `SUPABASE_*`.
+- `--dry-run`: não sobe nada e não chama a rota. Mostra os caminhos no bucket, as URLs públicas e o corpo que mandaria. Não exige as credenciais (só avisa se faltarem).
+- Lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`. `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` vêm **só do ambiente**. Nunca imprime segredo nem chave; mensagens de erro passam por `sanitizar()`.
 
 ### Hospedagem das imagens
 
 Quem baixa as imagens é o **servidor do Meta**, não a rota. Então cada slide precisa estar numa **URL https pública**, acessível de fora sem login, e ser **JPEG**. A rota recusa `http`, `localhost`, IP privado e extensão que não seja `.jpg`/`.jpeg`. Se a URL não abrir de fora, o Meta devolve status `ERROR` e a rota responde 502 sem publicar.
 
-**Hospedagem: ver decisão no PR.**
+**Solução: bucket `instagram-temp` no Supabase do eternizacards**, usado só durante a publicação.
+
+- Bucket **público** (o Meta precisa baixar sem login), aceita só `image/jpeg`, máximo 8 MB por arquivo.
+- Plano Free do Supabase: **sem custo** dentro de 1 GB de armazenamento e 5 GB de tráfego por mês. Como os arquivos são apagados logo depois de publicar, o armazenamento fica perto de zero; o tráfego é basicamente o download do Meta (um carrossel de 10 slides de ~500 KB ≈ 5 MB).
+- Quem sobe e apaga é o **CLI, na máquina do operador**. A rota na Vercel não sabe do Supabase, e as `SUPABASE_*` **não vão pra Vercel**.
+
+**Credenciais.** `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` ficam num arquivo protegido do operador (`/home/box/.secrets/supabase-eterniza.env`, `chmod 600`). Carregue no terminal antes de rodar:
+
+```bash
+set -a; . /home/box/.secrets/supabase-eterniza.env; set +a
+```
+
+O CLI só lê essas duas do ambiente: nunca de argumento de linha de comando (vazaria no histórico e no `ps`), nunca do `.env.local`. A service role key passa por cima de RLS, então **não cole em lugar nenhum**. Ela nunca é impressa, e qualquer texto de erro passa por `sanitizar()` antes de aparecer.
+
+**Fluxo do `publicar` sem `--base-url`:**
+
+1. **Sem rede:** `--confirmar`, pasta, 2 a 10 `slide-NN.jpg`, legenda (`instagram-post.txt`), `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` + `PUBLICAR_SECRET`, e cada arquivo com **até 8 MB** e começando com os bytes JPEG (`FF D8 FF`). Qualquer falha aqui = nada sobe.
+2. **Upload**, na ordem dos slides, pra `instagram-temp/<slug>-<AAAAMMDD-HHMM>-<aleatório>/slide-NN.jpg` (`POST /storage/v1/object/instagram-temp/<caminho>` com `x-upsert: false`). O slug é o nome da pasta pai de `render` (ou da própria pasta, se ela não se chama `render`), só `[a-z0-9-]`. Hora em UTC.
+3. **Publica**: chama `POST /api/midia/publicar` com as URLs públicas `<SUPABASE_URL>/storage/v1/object/public/instagram-temp/<caminho>`.
+4. **Apaga** os arquivos que subiu (`DELETE /storage/v1/object/instagram-temp` com `{"prefixes": [...]}`). Isso roda **sempre**: depois de publicar, depois de erro da rota, depois de upload parcial (apaga o que chegou a subir) e também quando o resultado é incerto (timeout ou falha de rede chamando a rota).
+
+Por que apagar mesmo no caso incerto: o Meta baixa as imagens quando cria os containers, então o post publicado não depende mais delas. Se o apagar pegar uma publicação ainda em andamento, o pior caso é o container dar `ERROR` e nada ir pro ar. Nos dois casos a mensagem manda **conferir o perfil antes de rodar de novo**. Rodar de novo usa uma pasta nova no bucket (o carimbo muda), então não tem colisão.
+
+Se **apagar falhar**, o publish continua valendo (código de saída 0) e o CLI imprime um aviso com os caminhos pra apagar à mão no painel do Supabase (Storage → `instagram-temp`). Mesma coisa se você interromper com Ctrl+C no meio: confira o bucket e apague o que tiver sobrado.
 
 ### Envs
 
@@ -178,6 +209,8 @@ Quem baixa as imagens é o **servidor do Meta**, não a rota. Então cada slide 
 | `PUBLICAR_SECRET` | **a criar**: Vercel (production) + `.env.local` de quem usa o CLI | **Sensitive** serve, ninguém precisa ler de volta | mínimo 32 caracteres: `openssl rand -hex 32`. Sem ela a rota responde 503 |
 | `IG_ACCESS_TOKEN_ETERNIZA` | já existe, **só no target production** | Encrypted | em deploy de preview a rota responde 503 ("token não configurado"), então **preview da Vercel não publica**. Pra testar de ponta a ponta tem que ser em produção |
 | `MANYWATA_URL` | só `.env.local` (CLI) | — | opcional |
+| `SUPABASE_URL` | **só no ambiente local do operador**, carregada de `/home/box/.secrets/supabase-eterniza.env`. **Não na Vercel**, não no `.env.local` | — | `https://<projeto>.supabase.co` do eternizacards |
+| `SUPABASE_SERVICE_ROLE_KEY` | idem | — | passa por cima de RLS: nunca em argv, log ou chat. Só o CLI usa, pra subir/apagar no `instagram-temp` |
 
 Depois de criar: **`vercel --prod` de novo**.
 
@@ -191,7 +224,7 @@ Depois de criar: **`vercel --prod` de novo**.
 ### Como funciona por dentro
 
 - `api/_lib/` não vira rota na Vercel (prefixo `_`). Lá ficam `seguranca.js` (auth, sanitização, validação de URL), `instagram-publicacao.js` (cliente do Graph com `fetch`/`sleep`/`now` injetáveis + registro `TIPOS`) e `rotas-midia.js` (a rota).
-- **Sem banco nem store**: cada chamada é independente.
+- **Sem banco nem store** na rota: cada chamada é independente. O único armazenamento é o bucket temporário que o CLI usa (`scripts/_storage.mjs`: `lerCredenciaisStorage`, `lerSlidesJpeg`, `enviarParaStorage`, `apagarDoStorage`, todos com `fetch` injetável).
 - Tempo: a função tem 60s (`vercel.json`). Os containers têm até ~45s; o resto fica pro `media_publish` e o permalink. Imagem costuma ficar `FINISHED` na hora.
 - O token vai no header `Authorization: Bearer`, nunca na URL. Toda mensagem de erro e de log passa por `sanitizar()`, que tira `access_token=`, `Bearer ...` e os segredos conhecidos.
 
@@ -204,7 +237,7 @@ O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `RE
 2. `criarContainers()`: `criarContainer({ media_type: "REELS", video_url, caption, cover_url?, share_to_feed? })`.
 3. **Tempo**: vídeo leva minutos pra ficar `FINISHED`, não cabe em 60s. Vai precisar dividir em duas chamadas (uma cria o container e devolve o id, outra checa o status e publica quando estiver `FINISHED`), mantendo `confirmar: true` e a checagem de cota antes de criar.
 4. Limites do Meta (duração, proporção recomendada 9:16, tamanho do arquivo): conferir na doc de Content Publishing na hora de implementar. Pela URL não dá pra checar; documentar e deixar o `status` `ERROR` do Meta explicar.
-5. Hospedagem: vídeo pesa bem mais que JPEG; vale revisar a decisão de hospedagem pra vídeo.
+5. Hospedagem: o bucket `instagram-temp` só aceita `image/jpeg` até 8 MB. Vídeo vai precisar de outra regra de MIME/tamanho (ou outro bucket), e de manter o arquivo até o container ficar `FINISHED`, que pode levar minutos.
 6. Testes: os mesmos do carrossel trocando os params + o fluxo em duas chamadas.
 
 **Stories**

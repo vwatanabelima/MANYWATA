@@ -2,7 +2,7 @@
 // fetch falso: nenhum teste chama o Instagram de verdade.
 
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotaPublicar } from "../api/_lib/rotas-midia.js";
@@ -11,6 +11,15 @@ import { TIPOS, validarLegenda } from "../api/_lib/instagram-publicacao.js";
 import rotaMidiaPublicar from "../api/midia/publicar.js";
 import aliasCarrossel from "../api/carrossel/publicar.js";
 import { listarSlides, montarUrls, executar } from "../scripts/midia.mjs";
+import {
+  MAX_BYTES,
+  carimbo,
+  sanitizarSlug,
+  slugDaPasta,
+  lerCredenciaisStorage,
+  enviarParaStorage,
+  apagarDoStorage,
+} from "../scripts/_storage.mjs";
 
 const SEGREDO = "segredo-de-teste-com-bem-mais-de-32-caracteres";
 const TOKEN = "IGAAtokenSuperSecretoDaEterniza0123456789";
@@ -604,9 +613,11 @@ describe("scripts/midia.mjs", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("sem --base-url recusa e lista os slides", async () => {
+  test("sem --base-url e sem SUPABASE_* no ambiente: recusa sem chamar nada", async () => {
     const fetch = fetchServidor();
-    await expect(executar(["publicar", pasta, "--confirmar"], { fetch, lerVar: vars() })).rejects.toThrow(/--base-url[\s\S]*slide-01\.jpg/);
+    await expect(executar(["publicar", pasta, "--confirmar"], { fetch, lerVar: vars(), env: {} })).rejects.toThrow(
+      /SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY[\s\S]*--base-url/
+    );
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -672,5 +683,337 @@ describe("scripts/midia.mjs", () => {
       })
     ).rejects.toThrow(/PUBLICAR_SECRET/);
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+// ── CLI + Supabase Storage (fetch falso, nunca rede) ──────────────────────
+
+describe("scripts/midia.mjs com Supabase Storage", () => {
+  const CHAVE = "eyJhbGciOiJIUzI1NiJ9.chave-service-role-de-teste-0123456789";
+  const SUPA = "https://abcdefgh.supabase.co";
+  const ENV_SB = { SUPABASE_URL: `${SUPA}/`, SUPABASE_SERVICE_ROLE_KEY: CHAVE };
+  const AGORA = () => new Date("2026-11-15T01:05:00Z");
+  const PREFIXO = "drop-natal-cartas-20261115-0105-a1b2c3";
+  const NOMES = ["slide-01.jpg", "slide-2.jpg", "slide-10.jpg"];
+  const CAMINHOS = NOMES.map((n) => `${PREFIXO}/${n}`);
+  const PUBLICAS = CAMINHOS.map((c) => `${SUPA}/storage/v1/object/public/instagram-temp/${c}`);
+  const respostaOk = { mediaId: "9001", permalink: "https://www.instagram.com/p/ABC123/", username: "eternizacards", quota: { usado: 4, total: 50 } };
+  const jpeg = (n = 64) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(n)]);
+
+  let raiz, pasta;
+  beforeEach(() => {
+    raiz = mkdtempSync(join(tmpdir(), "carrossel-"));
+    pasta = join(raiz, "Drop Natal: Cartas!", "render");
+    mkdirSync(pasta, { recursive: true });
+    NOMES.forEach((n, i) => writeFileSync(join(pasta, n), jpeg(10 + i)));
+    writeFileSync(join(pasta, "capa.png"), "nao entra");
+    writeFileSync(join(pasta, "instagram-post.txt"), `${LEGENDA}\n`);
+  });
+  afterEach(() => {
+    rmSync(raiz, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  // Responde Storage (upload/delete) e a rota. `falha(chamada, todas)` decide
+  // por chamada: Error = falha de rede, {status, body} = resposta de erro.
+  function servidor({ falha = () => null } = {}) {
+    const chamadas = [];
+    const fetch = vi.fn(async (url, init = {}) => {
+      const c = { url, metodo: init.method, headers: init.headers, body: init.body };
+      chamadas.push(c);
+      const f = falha(c, chamadas);
+      if (f instanceof Error) throw f;
+      if (f) return { ok: false, status: f.status, json: async () => f.body ?? {} };
+      if (url.endsWith("/api/midia/publicar")) return { ok: true, status: 200, json: async () => respostaOk };
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    const tipo = (c) =>
+      c.url.endsWith("/api/midia/publicar") ? "rota" : c.metodo === "DELETE" ? "delete" : c.metodo === "POST" ? "upload" : "?";
+    return { fetch, chamadas, tipos: () => chamadas.map(tipo) };
+  }
+  const ehRota = (c) => c.url.endsWith("/api/midia/publicar");
+
+  const vars = (extra = {}) => (nome) => ({ PUBLICAR_SECRET: SEGREDO, MANYWATA_URL: "https://manywata.vercel.app", ...extra })[nome];
+  const rodar = (fetch, { argv = [], env = ENV_SB, lerVar = vars(), ...resto } = {}) =>
+    executar(["publicar", pasta, "--confirmar", ...argv], {
+      fetch,
+      env,
+      lerVar,
+      agora: AGORA,
+      sufixo: "a1b2c3",
+      log: () => {},
+      avisar: () => {},
+      ...resto,
+    });
+  const prefixesApagados = (chamadas) => JSON.parse(chamadas.find((c) => c.metodo === "DELETE").body).prefixes;
+
+  test("sobe na ordem com headers certos, passa as URLs públicas pra rota e apaga depois", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    const linhas = [];
+    const r = await rodar(fetch, { log: (l) => linhas.push(l) });
+
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(["upload", "upload", "upload", "rota", "delete"]);
+    chamadas.slice(0, 3).forEach((c, i) => {
+      expect(c.url).toBe(`${SUPA}/storage/v1/object/instagram-temp/${CAMINHOS[i]}`);
+      expect(c.metodo).toBe("POST");
+      expect(c.headers).toEqual({
+        Authorization: `Bearer ${CHAVE}`,
+        apikey: CHAVE,
+        "Content-Type": "image/jpeg",
+        "x-upsert": "false",
+      });
+      expect(Buffer.from(c.body).equals(jpeg(10 + i))).toBe(true);
+    });
+
+    const rota = chamadas[3];
+    expect(rota.headers.Authorization).toBe(`Bearer ${SEGREDO}`);
+    expect(JSON.parse(rota.body)).toEqual({
+      conta: "eterniza",
+      tipo: "CAROUSEL",
+      itens: PUBLICAS.map((url) => ({ url })),
+      legenda: `${LEGENDA}\n`,
+      confirmar: true,
+    });
+    // a rota aceita essas URLs (https pública)
+    for (const url of PUBLICAS) expect(validarUrlPublica(url)).toBe(url);
+
+    const del = chamadas[4];
+    expect(del.url).toBe(`${SUPA}/storage/v1/object/instagram-temp`);
+    expect(del.headers).toMatchObject({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE, "Content-Type": "application/json" });
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+
+    const saida = linhas.join("\n");
+    expect(saida).toContain("https://www.instagram.com/p/ABC123/");
+    expect(saida).toMatch(/Temporários apagados/);
+  });
+
+  test.each([
+    ["sem nenhuma", {}, /SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY/],
+    ["sem SUPABASE_URL", { SUPABASE_SERVICE_ROLE_KEY: CHAVE }, /Falta SUPABASE_URL no ambiente/],
+    ["sem a chave", { SUPABASE_URL: SUPA }, /Falta SUPABASE_SERVICE_ROLE_KEY/],
+    ["chave em branco", { SUPABASE_URL: SUPA, SUPABASE_SERVICE_ROLE_KEY: "   " }, /Falta SUPABASE_SERVICE_ROLE_KEY/],
+    ["URL http", { SUPABASE_URL: "http://abcdefgh.supabase.co", SUPABASE_SERVICE_ROLE_KEY: CHAVE }, /SUPABASE_URL inválida/],
+    ["URL lixo", { SUPABASE_URL: "nao-e-url", SUPABASE_SERVICE_ROLE_KEY: CHAVE }, /SUPABASE_URL inválida/],
+  ])("credencial %s → erro claro e zero fetch", async (_n, env, msg) => {
+    const { fetch } = servidor();
+    const erro = await rodar(fetch, { env }).catch((e) => e);
+    expect(erro.message).toMatch(msg);
+    expect(erro.message).not.toContain(CHAVE);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("lê só do env: SUPABASE_* vindo do lerVar (.env.local) não conta", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { env: {}, lerVar: vars(ENV_SB) })).rejects.toThrow(/SUPABASE_URL/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("sem PUBLICAR_SECRET → recusa antes de subir", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { lerVar: vars({ PUBLICAR_SECRET: undefined }) })).rejects.toThrow(/PUBLICAR_SECRET/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("arquivo que não é JPEG → erro e nenhum upload", async () => {
+    writeFileSync(join(pasta, "slide-2.jpg"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/slide-2\.jpg não é JPEG/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("arquivo vazio → erro e nenhum upload", async () => {
+    writeFileSync(join(pasta, "slide-01.jpg"), "");
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/slide-01\.jpg não é JPEG/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("arquivo > 8 MB → erro e nenhum upload; exatamente 8 MB passa", async () => {
+    writeFileSync(join(pasta, "slide-10.jpg"), jpeg(MAX_BYTES - 3));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/slide-10\.jpg tem 8\.0 MB; o limite do bucket é 8 MB/);
+    expect(fetch).not.toHaveBeenCalled();
+
+    writeFileSync(join(pasta, "slide-10.jpg"), jpeg(MAX_BYTES - 4));
+    await expect(rodar(servidor().fetch)).resolves.toMatchObject({ mediaId: "9001" });
+  });
+
+  test("sem legenda → erro e nenhum upload", async () => {
+    rmSync(join(pasta, "instagram-post.txt"));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/Não achei a legenda/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("1 slide só → erro e nenhum upload", async () => {
+    rmSync(join(pasta, "slide-2.jpg"));
+    rmSync(join(pasta, "slide-10.jpg"));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/2 a 10 slides/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("rota devolve erro (429) → apaga tudo o que subiu", async () => {
+    const { fetch, chamadas, tipos } = servidor({
+      falha: (c) => (ehRota(c) ? { status: 429, body: { erro: "limite de publicação atingido (50/50)" } } : null),
+    });
+    await expect(rodar(fetch)).rejects.toThrow(/HTTP 429: limite/);
+    expect(tipos()).toEqual(["upload", "upload", "upload", "rota", "delete"]);
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+  });
+
+  test("rota 504 sem detalhe (incerto) → apaga e manda conferir o perfil", async () => {
+    const { fetch, chamadas } = servidor({ falha: (c) => (ehRota(c) ? { status: 504 } : null) });
+    await expect(rodar(fetch)).rejects.toThrow(/confira o perfil ANTES de rodar de novo/);
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+  });
+
+  test("falha de rede na rota (incerto) → apaga e manda conferir o perfil", async () => {
+    const { fetch, chamadas } = servidor({ falha: (c) => (ehRota(c) ? new TypeError("fetch failed") : null) });
+    await expect(rodar(fetch)).rejects.toThrow(/Pode ter publicado mesmo assim: confira o perfil/);
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+  });
+
+  test("upload parcial (2º recusado) → não chama a rota e apaga o que foi tentado", async () => {
+    const { fetch, chamadas, tipos } = servidor({
+      falha: (c, todas) => (c.metodo === "POST" && todas.length === 2 ? { status: 500, body: { message: "Internal" } } : null),
+    });
+    await expect(rodar(fetch)).rejects.toThrow(/Storage recusou slide-2\.jpg \(HTTP 500\): Internal[\s\S]*Nada foi publicado/);
+    expect(tipos()).toEqual(["upload", "upload", "delete"]);
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS.slice(0, 2));
+  });
+
+  test("falha de rede no 1º upload → não chama a rota e apaga mesmo assim", async () => {
+    const { fetch, chamadas, tipos } = servidor({ falha: (_c, todas) => (todas.length === 1 ? new TypeError("fetch failed") : null) });
+    await expect(rodar(fetch)).rejects.toThrow(/Falha de rede subindo slide-01\.jpg/);
+    expect(tipos()).toEqual(["upload", "delete"]);
+    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS.slice(0, 1));
+  });
+
+  test("apagar falhou depois de publicar → sucesso mesmo assim, com aviso listando os caminhos", async () => {
+    const { fetch } = servidor({ falha: (c) => (c.metodo === "DELETE" ? { status: 503, body: { message: "indisponível" } } : null) });
+    const avisos = [];
+    const r = await rodar(fetch, { avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    const aviso = avisos.join("\n");
+    expect(aviso).toMatch(/não consegui apagar/);
+    for (const c of CAMINHOS) expect(aviso).toContain(`instagram-temp/${c}`);
+  });
+
+  test("apagar falhou depois de erro da rota → o erro da rota continua sendo o erro", async () => {
+    const { fetch } = servidor({
+      falha: (c) =>
+        c.metodo === "DELETE"
+          ? new TypeError("fetch failed")
+          : ehRota(c)
+            ? { status: 400, body: { erro: "itens[0].url inválida" } }
+            : null,
+    });
+    const avisos = [];
+    await expect(rodar(fetch, { avisar: (l) => avisos.push(l) })).rejects.toThrow(/HTTP 400: itens\[0\]/);
+    expect(avisos.join("\n")).toMatch(/não consegui apagar/);
+  });
+
+  test("--base-url pula o Storage mesmo com SUPABASE_* no ambiente", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    await rodar(fetch, { argv: ["--base-url", "https://cdn.exemplo.com/c1"] });
+    expect(tipos()).toEqual(["rota"]);
+    expect(JSON.parse(chamadas[0].body).itens[0].url).toBe("https://cdn.exemplo.com/c1/slide-01.jpg");
+  });
+
+  test("--dry-run: zero fetch, mostra caminhos e URLs públicas", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    const r = await rodar(fetch, { argv: ["--dry-run"], log: (l) => linhas.push(l) });
+    expect(r).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    const saida = linhas.join("\n");
+    for (const c of CAMINHOS) expect(saida).toContain(`instagram-temp/${c}`);
+    for (const u of PUBLICAS) expect(saida).toContain(u);
+    expect(saida).not.toContain(CHAVE);
+  });
+
+  test("--dry-run sem credenciais nem PUBLICAR_SECRET: zero fetch, só avisa", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    await rodar(fetch, { argv: ["--dry-run"], env: {}, lerVar: vars({ PUBLICAR_SECRET: undefined }), log: (l) => linhas.push(l) });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(linhas.join("\n")).toMatch(/SUPABASE_URL\/SUPABASE_SERVICE_ROLE_KEY ausentes[\s\S]*<SUPABASE_URL>\/storage/);
+  });
+
+  test("a chave nunca aparece em stdout/stderr/erros, mesmo com o servidor ecoando", async () => {
+    const espioes = ["log", "warn", "error", "info", "debug"].map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
+    const eco = `apikey ${CHAVE} Authorization: Bearer ${CHAVE}`;
+    // log/avisar padrão (console), pra pegar tudo no espião
+    const real = (fetch, argv = [], env = ENV_SB) =>
+      executar(["publicar", pasta, "--confirmar", ...argv], { fetch, env, lerVar: vars(), agora: AGORA, sufixo: "a1b2c3" });
+    const erros = [];
+    const pega = (p) => p.catch((e) => erros.push(e.message));
+    const upload = (c) => c.metodo === "POST" && !ehRota(c);
+
+    await pega(real(servidor().fetch)); // feliz
+    await pega(real(servidor({ falha: (c) => (upload(c) ? { status: 403, body: { message: eco } } : null) }).fetch));
+    await pega(real(servidor({ falha: (_c, t) => (t.length === 2 ? new TypeError(`fetch failed ${eco}`) : null) }).fetch));
+    await pega(real(servidor({ falha: (c) => (ehRota(c) ? { status: 502, body: { erro: eco } } : null) }).fetch));
+    await pega(real(servidor({ falha: (c) => (ehRota(c) ? new TypeError(eco) : null) }).fetch));
+    await pega(real(servidor({ falha: (c) => (c.metodo === "DELETE" ? { status: 500, body: { error: eco } } : null) }).fetch));
+    await pega(real(servidor({ falha: (c) => (c.metodo === "DELETE" ? new TypeError(eco) : null) }).fetch));
+    await pega(real(servidor().fetch, [], { SUPABASE_URL: `x${CHAVE}`, SUPABASE_SERVICE_ROLE_KEY: CHAVE }));
+    await pega(real(servidor().fetch, ["--dry-run"]));
+
+    expect(erros).toHaveLength(5);
+    const logado = espioes.flatMap((s) => s.mock.calls.flat()).map(String).join("\n");
+    expect(logado).toMatch(/não consegui apagar/);
+    expect(logado).toMatch(/Publicado em @eternizacards/);
+    const tudo = `${erros.join("\n")}\n${logado}`;
+    expect(tudo).toContain("[oculto]");
+    expect(tudo).not.toContain(CHAVE);
+    expect(tudo).not.toContain(SEGREDO);
+  });
+});
+
+describe("scripts/_storage.mjs (partes)", () => {
+  const cred = { url: "https://abcdefgh.supabase.co", chave: "chave-service-role-de-teste-0123456789" };
+
+  test("sanitizarSlug / slugDaPasta", () => {
+    expect(sanitizarSlug("Drop Natal: Cartas!")).toBe("drop-natal-cartas");
+    expect(sanitizarSlug("Edição Ç ÁÉÍ")).toBe("edicao-c-aei");
+    expect(sanitizarSlug("***")).toBe("carrossel");
+    expect(sanitizarSlug("a".repeat(70))).toHaveLength(60);
+    expect(slugDaPasta("/tmp/x/Lançamento 2026/render")).toBe("lancamento-2026");
+    expect(slugDaPasta("/tmp/x/Lançamento 2026/RENDER/")).toBe("lancamento-2026");
+    expect(slugDaPasta("/tmp/x/meu_post")).toBe("meu-post");
+  });
+
+  test("carimbo: AAAAMMDD-HHMM (UTC) + sufixo aleatório", () => {
+    expect(carimbo(new Date("2026-11-15T01:05:59Z"), "abc123")).toBe("20261115-0105-abc123");
+    expect(carimbo(new Date("2026-01-02T23:09:00Z"))).toMatch(/^20260102-2309-[0-9a-f]{6}$/);
+  });
+
+  test("lerCredenciaisStorage normaliza a URL (sem barra final)", () => {
+    expect(lerCredenciaisStorage({ SUPABASE_URL: " https://abcdefgh.supabase.co/ ", SUPABASE_SERVICE_ROLE_KEY: " k " })).toEqual({
+      url: "https://abcdefgh.supabase.co",
+      chave: "k",
+    });
+  });
+
+  test("enviarParaStorage: tudo ok devolve caminhos e URLs públicas", async () => {
+    const fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
+    const r = await enviarParaStorage({ arquivos: [{ nome: "slide-01.jpg", bytes: Buffer.from([0xff, 0xd8, 0xff]) }], prefixo: "p-1", cred, fetch });
+    expect(r).toEqual({
+      caminhos: ["p-1/slide-01.jpg"],
+      urls: ["https://abcdefgh.supabase.co/storage/v1/object/public/instagram-temp/p-1/slide-01.jpg"],
+    });
+  });
+
+  test("apagarDoStorage: lista vazia não chama nada; erro HTTP vira exceção sanitizada", async () => {
+    const fetch = vi.fn(async () => ({ ok: false, status: 400, json: async () => ({ message: `ruim ${cred.chave}` }) }));
+    await apagarDoStorage({ caminhos: [], cred, fetch });
+    expect(fetch).not.toHaveBeenCalled();
+    const e = await apagarDoStorage({ caminhos: ["p/a.jpg"], cred, fetch }).catch((x) => x);
+    expect(e.message).toBe("Storage recusou apagar (HTTP 400): ruim [oculto]");
+    expect(fetch.mock.calls[0][1].method).toBe("DELETE");
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toEqual({ prefixes: ["p/a.jpg"] });
   });
 });
