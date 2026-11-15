@@ -9,7 +9,9 @@
     "test": "vitest run",
     "insights": "node scripts/insights.mjs",
     "insights:eterniza": "node scripts/insights.mjs --conta eterniza",
-    "insights:todas": "node scripts/insights.mjs --conta all"
+    "insights:todas": "node scripts/insights.mjs --conta all",
+    "midia": "node scripts/midia.mjs",
+    "midia:publicar": "node scripts/midia.mjs publicar"
   },
   "devDependencies": {
     "vitest": "^2.1.8"
