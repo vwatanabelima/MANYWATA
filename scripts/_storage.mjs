@@ -49,7 +49,7 @@ export function lerCredenciaisStorage(env = process.env) {
 
 // ── Nomes ─────────────────────────────────────────────────────────────────
 
-export function sanitizarSlug(texto) {
+export function sanitizarSlug(texto, padrao = "carrossel") {
   const s = String(texto ?? "")
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "")
@@ -58,7 +58,7 @@ export function sanitizarSlug(texto) {
     .replace(/^-+|-+$/g, "")
     .slice(0, 60)
     .replace(/-+$/, "");
-  return s || "carrossel";
+  return s || padrao;
 }
 
 // carrossel/drop-natal/render → "drop-natal"; pasta com outro nome → o próprio nome.
@@ -104,6 +104,42 @@ export function lerSlidesJpeg(pasta, slides) {
     if (!ehJpeg(bytes)) throw new Error(`${nome} não é JPEG (não começa com FF D8 FF). Nada foi enviado.`);
     return { nome, bytes };
   });
+}
+
+// Largura x altura lidas do cabeçalho do JPEG (segmento SOFn), sem
+// dependência. Devolve null se não achar (arquivo truncado/estranho): quem
+// chama só avisa, nunca bloqueia. Não aplica a rotação do EXIF: uma foto de
+// celular "em pé" pode aparecer aqui como 1920x1080.
+export function dimensoesJpeg(bytes) {
+  if (!ehJpeg(bytes)) return null;
+  let i = 2;
+  while (i + 3 < bytes.length) {
+    if (bytes[i] !== 0xff) return null;
+    const marcador = bytes[i + 1];
+    if (marcador === 0xff) {
+      i++; // byte de preenchimento
+      continue;
+    }
+    // marcadores sem tamanho: TEM, RSTn, SOI, EOI
+    if (marcador === 0x01 || (marcador >= 0xd0 && marcador <= 0xd9)) {
+      if (marcador === 0xd9) return null;
+      i += 2;
+      continue;
+    }
+    const tamanho = (bytes[i + 2] << 8) | bytes[i + 3];
+    if (tamanho < 2) return null;
+    // SOF0..SOF15, menos DHT (C4), JPG (C8) e DAC (CC)
+    const ehSof = marcador >= 0xc0 && marcador <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marcador);
+    if (ehSof) {
+      if (i + 8 >= bytes.length) return null;
+      const altura = (bytes[i + 5] << 8) | bytes[i + 6];
+      const largura = (bytes[i + 7] << 8) | bytes[i + 8];
+      return largura && altura ? { largura, altura } : null;
+    }
+    if (marcador === 0xda) return null; // começou a imagem e não achou SOF
+    i += 2 + tamanho;
+  }
+  return null;
 }
 
 // ── Storage REST ──────────────────────────────────────────────────────────

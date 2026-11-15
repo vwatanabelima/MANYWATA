@@ -1,15 +1,22 @@
-// CLI pra publicar um carrossel aprovado. Fala com POST /api/midia/publicar
-// do MANYWATA (não com o Instagram direto).
+// CLI pra publicar um carrossel ou um story aprovado. Fala com POST
+// /api/midia/publicar do MANYWATA (não com o Instagram direto).
 //
 // Uso:
 //   node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
+//   node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
 //   node scripts/midia.mjs limpar <prefixo> --confirmar
 //
-// Só rode o publicar com o ok do Vinicius nas imagens e no texto: a chamada
-// publica direto, não tem rascunho. Sem --confirmar o CLI recusa.
+// Só rode o publicar/story com o ok do Vinicius nas imagens e no texto: a
+// chamada publica direto, não tem rascunho. Sem --confirmar o CLI recusa.
 //
 // A pasta de render tem slide-01.jpg, slide-02.jpg, ... (ordem numérica,
 // slide-2 antes de slide-10) e instagram-post.txt com a legenda.
+//
+// story: 1 JPEG (FF D8 FF, até 8 MB), SEM legenda (Story não tem caption na
+// API). Avisa, sem bloquear, se não for 1080x1920. Sobe pra
+// instagram-temp/<slug-do-arquivo>-<carimbo>/<slug-do-arquivo>.jpg e segue
+// a mesma regra de limpeza abaixo. Com --base-url a URL é
+// <base-url>/<nome-do-arquivo>.
 //
 // Quem baixa as imagens é o servidor do Meta, então elas precisam estar numa
 // URL https pública:
@@ -42,7 +49,7 @@
 // imprime segredo nem chave.
 
 import { readFileSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sanitizar } from "../api/_lib/seguranca.js";
 import { CLI_TIMEOUT_ROTA_MS, MAX_DURATION_S } from "../api/_lib/tempos.js";
@@ -50,12 +57,14 @@ import {
   BUCKET,
   apagarDoStorage,
   carimbo,
+  dimensoesJpeg,
   enviarParaStorage,
   lerCredenciaisStorage,
   lerSlidesJpeg,
   listarDoStorage,
   montarCaminhos,
   normalizarPrefixo,
+  sanitizarSlug,
   slugDaPasta,
   urlPublica,
 } from "./_storage.mjs";
@@ -65,6 +74,7 @@ const URL_PADRAO = "https://manywata.vercel.app";
 const ROTA = "/api/midia/publicar";
 const USO = [
   "Uso: node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]",
+  "     node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]",
   "     node scripts/midia.mjs limpar <prefixo> --confirmar",
 ].join("\n");
 const CONFERIR = "confira o perfil ANTES de rodar de novo.";
@@ -135,6 +145,8 @@ export async function executar(
   const tem = (flag) => resto.includes(flag);
 
   if (comando === "limpar") return limpar({ resto, tem, env, fetch, log });
+  const io = { fetch, lerVar, env, log, avisar, agora, sufixo, timeoutRotaMs };
+  if (comando === "story") return story({ resto, tem, opt, ...io });
   if (comando !== "publicar") throw new Error(USO);
   if (!tem("--confirmar")) {
     throw new Error("Recusado: publicar exige --confirmar. Só rode com o ok do Vinicius nas imagens e no texto.");
@@ -189,25 +201,122 @@ export async function executar(
   }
   const arquivos = lerSlidesJpeg(pasta, slides);
   const prefixo = `${slugDaPasta(pasta)}-${carimbo(agora(), sufixo)}`;
-  const caminhos = montarCaminhos(prefixo, slides);
 
   if (dryRun) {
-    let credDry = null;
-    try {
-      credDry = lerCredenciaisStorage(env);
-    } catch {
-      // só avisa
-    }
-    log(`[dry-run] subiria ${caminhos.length} JPEG(s) pro Supabase Storage (nada foi enviado):`);
-    for (const c of caminhos) log(`  ${BUCKET}/${c}`);
-    if (!credDry) {
-      log("  aviso: SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY ausentes ou inválidas no ambiente; o publicar de verdade vai recusar.");
-    }
-    mostrarDryRun(corpo(caminhos.map((c) => urlPublica(credDry?.url ?? "<SUPABASE_URL>", c))));
-    log(`[dry-run] depois de publicar, apagaria ${BUCKET}/${prefixo}/ (se o resultado for definido)`);
+    dryRunStorage({ env, prefixo, nomes: slides, montarCorpo: corpo, mostrarDryRun, log });
     return null;
   }
+  return publicarViaStorage({ arquivos, prefixo, cred, segredo, montarCorpo: corpo, conta, base, fetch, log, avisar, timeoutRotaMs });
+}
 
+// ── story <arquivo.jpg> ───────────────────────────────────────────────────
+
+// Story de UMA imagem JPEG, sem legenda (a API não aceita caption em
+// STORIES). Mesmo fluxo do publicar: valida tudo sem rede, sobe pro
+// instagram-temp/<slug-do-arquivo>-<carimbo>/<slug-do-arquivo>.jpg, chama a
+// rota com tipo STORIES e apaga só quando o resultado é definido.
+async function story({ resto, tem, opt, fetch, lerVar, env, log, avisar, agora, sufixo, timeoutRotaMs }) {
+  if (!tem("--confirmar")) {
+    throw new Error("Recusado: story exige --confirmar. Só rode com o ok do Vinicius na imagem.");
+  }
+  const arquivo = resto[0] && !resto[0].startsWith("--") ? resto[0] : undefined;
+  if (!arquivo) throw new Error(`Falta o arquivo JPEG do story.\n${USO}`);
+
+  // Mesma checagem dos slides do carrossel: <= 8 MB e começa com FF D8 FF.
+  const nome = basename(arquivo);
+  let bytes;
+  try {
+    [{ bytes }] = lerSlidesJpeg(dirname(arquivo), [nome]);
+  } catch (e) {
+    if (e?.code) throw new Error(`Não consegui ler o arquivo ${arquivo}.`); // ENOENT, EISDIR, ...
+    throw e;
+  }
+  avisarDimensoes(bytes, nome, avisar);
+
+  const conta = opt("--conta") || "eterniza";
+  // Sem legenda: o campo nem vai no corpo.
+  const corpo = (urls) => ({ conta, tipo: "STORIES", itens: urls.map((url) => ({ url })), confirmar: true });
+  const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
+  const dryRun = tem("--dry-run");
+  const mostrarDryRun = (c) => {
+    log(`[dry-run] POST ${base}${ROTA}  (nada foi enviado)`);
+    log(JSON.stringify(c, null, 2));
+  };
+
+  // ── Com --base-url: a imagem já está em <base-url>/<nome do arquivo> ──
+  const baseUrl = opt("--base-url");
+  if (baseUrl) {
+    const c = corpo(montarUrls(baseUrl, [nome]));
+    if (dryRun) {
+      mostrarDryRun(c);
+      return null;
+    }
+    return chamarRota({ fetch, base, segredo: exigirSegredo(lerVar), corpo: c, log, timeoutMs: timeoutRotaMs });
+  }
+
+  // ── Sem --base-url: Storage ──
+  const cred = dryRun ? null : lerCredenciaisStorage(env);
+  const segredo = dryRun ? null : exigirSegredo(lerVar);
+  const slug = sanitizarSlug(nome.replace(/\.[^.]*$/, ""), "story");
+  const prefixo = `${slug}-${carimbo(agora(), sufixo)}`;
+  const nomeNoBucket = `${slug}.jpg`;
+
+  if (dryRun) {
+    dryRunStorage({ env, prefixo, nomes: [nomeNoBucket], montarCorpo: corpo, mostrarDryRun, log });
+    return null;
+  }
+  return publicarViaStorage({
+    arquivos: [{ nome: nomeNoBucket, bytes }],
+    prefixo,
+    cred,
+    segredo,
+    montarCorpo: corpo,
+    conta,
+    base,
+    fetch,
+    log,
+    avisar,
+    timeoutRotaMs,
+  });
+}
+
+// Story é 9:16; o recomendado é 1080x1920. Fora disso o Instagram corta ou
+// põe borda, mas publica: só avisa.
+export const STORY_LARGURA = 1080;
+export const STORY_ALTURA = 1920;
+function avisarDimensoes(bytes, nome, avisar) {
+  const d = dimensoesJpeg(bytes);
+  if (!d) {
+    avisar(`aviso: não consegui ler as dimensões de ${nome}; o recomendado pra story é ${STORY_LARGURA}x${STORY_ALTURA}. Seguindo mesmo assim.`);
+  } else if (d.largura !== STORY_LARGURA || d.altura !== STORY_ALTURA) {
+    avisar(
+      `aviso: ${nome} tem ${d.largura}x${d.altura}; o recomendado pra story é ${STORY_LARGURA}x${STORY_ALTURA} (9:16). O Instagram pode cortar ou pôr borda. Seguindo mesmo assim.`
+    );
+  }
+}
+
+// ── Partes comuns do fluxo com Storage (publicar e story) ─────────────────
+
+function dryRunStorage({ env, prefixo, nomes, montarCorpo, mostrarDryRun, log }) {
+  let credDry = null;
+  try {
+    credDry = lerCredenciaisStorage(env);
+  } catch {
+    // só avisa
+  }
+  const caminhos = montarCaminhos(prefixo, nomes);
+  log(`[dry-run] subiria ${caminhos.length} JPEG(s) pro Supabase Storage (nada foi enviado):`);
+  for (const c of caminhos) log(`  ${BUCKET}/${c}`);
+  if (!credDry) {
+    log("  aviso: SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY ausentes ou inválidas no ambiente; o publicar de verdade vai recusar.");
+  }
+  mostrarDryRun(montarCorpo(caminhos.map((c) => urlPublica(credDry?.url ?? "<SUPABASE_URL>", c))));
+  log(`[dry-run] depois de publicar, apagaria ${BUCKET}/${prefixo}/ (se o resultado for definido)`);
+}
+
+// Sobe, chama a rota e apaga os temporários SÓ quando o resultado é
+// definido (ver "Limpeza" no topo do arquivo).
+async function publicarViaStorage({ arquivos, prefixo, cred, segredo, montarCorpo, conta, base, fetch, log, avisar, timeoutRotaMs }) {
   const limpo = (texto) => sanitizar(texto, [cred.chave, segredo]);
 
   let enviados = [];
@@ -222,7 +331,7 @@ export async function executar(
       enviados = e.caminhos ?? [];
       throw new Error(`${e.message}\nNada foi publicado.`);
     }
-    return await chamarRota({ fetch, base, segredo, corpo: corpo(urls), log, timeoutMs: timeoutRotaMs });
+    return await chamarRota({ fetch, base, segredo, corpo: montarCorpo(urls), log, timeoutMs: timeoutRotaMs });
   } catch (e) {
     let msg = e?.message;
     if (e?.indefinido) {
@@ -258,7 +367,7 @@ function instrucoesIndefinido({ prefixo, enviados, conta }) {
     ...enviados.map((c) => `  ${BUCKET}/${c}`),
     "O que fazer:",
     `  1. Confira o perfil da conta "${conta}" (pode levar alguns minutos pra aparecer).`,
-    "  2. Se NÃO publicou: rode o publicar de novo (sobe numa pasta nova do bucket).",
+    "  2. Se NÃO publicou: rode o mesmo comando de novo (sobe numa pasta nova do bucket).",
     "  3. Depois (publicado ou não), apague estes temporários:",
     `       node scripts/midia.mjs limpar ${prefixo} --confirmar`,
     "     ou à mão no painel do Supabase (Storage → instagram-temp).",
@@ -280,9 +389,9 @@ function indefinido(mensagem) {
 }
 
 async function chamarRota({ fetch, base, segredo, corpo, log, timeoutMs }) {
-  log(
-    `Publicando carrossel (${corpo.itens.length} slides) em "${corpo.conta}"... pode levar alguns minutos (a rota tem até ${MAX_DURATION_S}s).`
-  );
+  const ehStory = corpo.tipo === "STORIES";
+  const oQue = ehStory ? "story (1 imagem)" : `carrossel (${corpo.itens.length} slides)`;
+  log(`Publicando ${oQue} em "${corpo.conta}"... pode levar alguns minutos (a rota tem até ${MAX_DURATION_S}s).`);
   let r;
   try {
     r = await fetch(`${base}${ROTA}`, {
@@ -308,7 +417,9 @@ async function chamarRota({ fetch, base, segredo, corpo, log, timeoutMs }) {
     if (!objeto?.mediaId) {
       throw indefinido(`HTTP ${r.status} sem mediaId na resposta: pode ter publicado, ${CONFERIR}`);
     }
-    log(`Publicado em @${objeto.username}: ${objeto.permalink || "(permalink indisponível)"}`);
+    // Story pode vir sem permalink; é normal, o media_id já confirma.
+    const semLink = ehStory ? "(story sem permalink; normal, o media_id confirma)" : "(permalink indisponível)";
+    log(`Publicado em @${objeto.username}: ${objeto.permalink || semLink}`);
     log(`  media_id: ${objeto.mediaId}  ·  cota 24h: ${objeto.quota?.usado}/${objeto.quota?.total}`);
     if (objeto.aviso) log(`  aviso: ${objeto.aviso}`);
     return objeto;
