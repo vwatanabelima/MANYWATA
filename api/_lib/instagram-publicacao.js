@@ -184,7 +184,7 @@ export function validarLegenda(legenda) {
   return texto;
 }
 
-// O Meta só aceita JPEG em carrossel/feed. Dá pra checar pela extensão;
+// O Meta só aceita JPEG em carrossel/feed/story de imagem. Dá pra checar pela extensão;
 // URL sem extensão passa (o Meta recusa depois com status ERROR se não for).
 export function exigirJpeg(url, rotulo) {
   const caminho = new URL(url).pathname.toLowerCase();
@@ -228,12 +228,14 @@ export async function emParalelo(tarefas, rotulo = (i) => `item ${i + 1}`) {
 //
 // Cada tipo de mídia é uma entrada. A rota é genérica: pega o tipo do body,
 // chama validar() (antes de qualquer fetch) e criarContainers(), e publica o
-// container que voltar. Pra ligar Reels ou Stories é só implementar a entrada
-// e virar `implementado: true`.
+// container que voltar. Pra ligar Reels é só implementar a entrada e virar
+// `implementado: true`.
 //
-//   validar(corpo)                     → { itens: [url...], legenda }  (ou ErroHttp 400)
+//   validar(corpo)                     → { itens: [url...], legenda? }  (ou ErroHttp 400/501)
 //   criarContainers(pub, dados, ctx)   → id do container FINAL, já FINISHED
 //     ctx.restanteMs()                 → quanto do orçamento de tempo sobrou
+//   permalinkOpcional (opcional)       → true: falha ao buscar o permalink
+//                                        depois de publicar não gera aviso
 
 export const TIPOS = {
   CAROUSEL: {
@@ -303,14 +305,72 @@ export const TIPOS = {
     descricao: "Reels (video_url, media_type=REELS, cover_url/share_to_feed opcionais)",
   },
 
-  // Falta: validar 1 item com image_url (JPEG) OU video_url, sem legenda
-  // (Stories não têm caption); criarContainer({ media_type: "STORIES",
-  // image_url | video_url }); vídeo com o mesmo problema de tempo do Reels.
+  // Story de IMAGEM: 1 JPEG, sem legenda (Story não tem caption na API).
+  //
+  // Story de VÍDEO continua 501 (ver README, "O que falta para Reels e
+  // Stories"). Falta: aceitar video_url (MP4/MOV), criarContainer({
+  // media_type: "STORIES", video_url }), e o mesmo problema de tempo do
+  // Reels (processar vídeo pode passar dos 300s da função), além de outro
+  // bucket/regra de MIME pra hospedar o vídeo.
+  //
+  // Stickers interativos (enquete, link, pergunta, menção clicável) NÃO
+  // existem na API de publicação: o story sai só com a imagem.
   STORIES: {
-    implementado: false,
-    descricao: "Stories (media_type=STORIES com image_url ou video_url)",
+    implementado: true,
+    descricao: "Story de 1 imagem JPEG, sem legenda (vídeo ainda não)",
+
+    validar(corpo) {
+      const itens = corpo.itens;
+      if (!Array.isArray(itens)) {
+        throw new ErroHttp(400, 'itens precisa ser uma lista com 1 item: [{"url": "https://..."}].');
+      }
+      if (itens.length !== 1) {
+        throw new ErroHttp(400, `story leva exatamente 1 item (veio ${itens.length}). Pra várias imagens, publique um story por vez.`);
+      }
+      const item = itens[0];
+      if (ehVideo(item)) {
+        throw new ErroHttp(
+          501,
+          "story de vídeo ainda não implementado (só imagem JPEG por enquanto). Ver README, \"O que falta para Reels e Stories\"."
+        );
+      }
+      const url = validarUrlPublica(item?.url, "itens[0].url");
+      exigirJpeg(url, "itens[0].url");
+
+      // Story não tem caption. Recusar em vez de ignorar, senão alguém acha
+      // que o texto vai aparecer.
+      const legenda = corpo.legenda;
+      const vazia = legenda === undefined || legenda === null || (typeof legenda === "string" && legenda.trim() === "");
+      if (!vazia) {
+        throw new ErroHttp(
+          400,
+          "story não tem legenda no Instagram (a API não aceita caption em STORIES). Tire o campo legenda; texto do story vai na própria imagem."
+        );
+      }
+      return { itens: [url] };
+    },
+
+    async criarContainers(pub, { itens }, ctx) {
+      const id = await pub.criarContainer({ image_url: itens[0], media_type: "STORIES" });
+      await pub.aguardarStatus(id, { timeoutMs: ctx.restanteMs() });
+      return id;
+    },
+
+    // Story pode não ter permalink (ou o Graph não devolver). Não é erro nem
+    // motivo de aviso: o mediaId já confirma a publicação.
+    permalinkOpcional: true,
   },
 };
+
+// Item de vídeo: campo video_url ou URL terminando em extensão de vídeo.
+function ehVideo(item) {
+  if (item && typeof item === "object" && item.video_url !== undefined) return true;
+  try {
+    return /\.(mp4|mov|m4v)$/i.test(new URL(String(item?.url)).pathname);
+  } catch {
+    return false;
+  }
+}
 
 // Resolve o tipo pedido. Desconhecido → 400; conhecido mas não pronto → 501.
 export function tipoDefinido(tipo) {
@@ -320,7 +380,8 @@ export function tipoDefinido(tipo) {
     throw new ErroHttp(400, `tipo "${tipo ?? ""}" desconhecido. Tipos: ${Object.keys(TIPOS).join(", ")}.`);
   }
   if (!def.implementado) {
-    throw new ErroHttp(501, `tipo ${nome} ainda não implementado (${def.descricao}). Hoje só CAROUSEL.`);
+    const prontos = Object.keys(TIPOS).filter((k) => TIPOS[k].implementado);
+    throw new ErroHttp(501, `tipo ${nome} ainda não implementado (${def.descricao}). Hoje: ${prontos.join(", ")}.`);
   }
   return { nome, def };
 }

@@ -80,6 +80,7 @@ function lerCorpo(req) {
 
 // ── POST /api/midia/publicar ──────────────────────────────────────────────
 // body: { conta: "eterniza", tipo: "CAROUSEL", itens: [{ url }], legenda, confirmar: true }
+//       { conta: "eterniza", tipo: "STORIES", itens: [{ url }], confirmar: true }  (1 JPEG, sem legenda)
 // No alias /api/carrossel/publicar o tipo é fixo (CAROUSEL) e pode ser omitido.
 
 export async function rotaPublicar(req, res, opcoes = {}) {
@@ -131,24 +132,32 @@ export async function rotaPublicar(req, res, opcoes = {}) {
       );
     }
 
-    // ── 3. Containers (filhos + final), todos FINISHED ────────────────────
+    // ── 3. Containers (carrossel: filhos + final; story: um só), FINISHED ─
     const prazo = ctx.now() + ctx.orcamentoMs;
     const containerId = await def.criarContainers(pub, dados, { restanteMs: () => prazo - ctx.now() });
 
     // ── 4. Publica ────────────────────────────────────────────────────────
     ctx.mediaPublishChamado = true;
     const mediaId = await pub.publicarContainer(containerId);
-    console.log(`[${conta.slug}] ${tipo} PUBLICADO: media ${mediaId} (container ${containerId}, ${dados.itens.length} itens).`);
+    const n = dados.itens.length;
+    console.log(`[${conta.slug}] ${tipo} PUBLICADO: media ${mediaId} (container ${containerId}, ${n} ${n === 1 ? "item" : "itens"}).`);
 
     // ── 5. Permalink. O post JÁ está no ar: falha aqui não pode virar erro,
     //       senão alguém tenta de novo achando que não publicou.
+    //       Tipos com permalinkOpcional (STORIES): sem permalink é normal,
+    //       volta permalink: null sem aviso.
     let permalink = null;
     let aviso;
     try {
       permalink = await pub.buscarPermalink(mediaId);
     } catch (e) {
-      aviso = `publicado, mas não deu pra buscar o permalink: ${sanitizar(e.message, ctx.segredos)}. NÃO publique de novo; confira no perfil.`;
-      console.warn(`[${conta.slug}] ${aviso}`);
+      const detalhe = sanitizar(e.message, ctx.segredos);
+      if (def.permalinkOpcional) {
+        console.log(`[${conta.slug}] ${tipo} ${mediaId} sem permalink (normal pra ${tipo}): ${detalhe}`);
+      } else {
+        aviso = `publicado, mas não deu pra buscar o permalink: ${detalhe}. NÃO publique de novo; confira no perfil.`;
+        console.warn(`[${conta.slug}] ${aviso}`);
+      }
     }
 
     return res.status(200).json({

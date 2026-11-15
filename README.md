@@ -69,7 +69,7 @@ npm test
 
 Cobre o cadastro de contas e o casamento de regras. Os testes de invariante existem pra pegar o pior bug possível aqui: duas contas apontando pro mesmo token, o que faria o DM de uma sair pela outra em silêncio.
 
-`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro.
+`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro. Stories: params exatos do container (`image_url` + `media_type: "STORIES"`, sem `caption`), 1 item só, legenda recusada, não-JPEG, 503/401/`confirmar` sem fetch, cota cheia sem container, story sem permalink → 200 sem aviso, vídeo e `REELS` → 501, alias do carrossel recusando `STORIES`, o subcomando `story` do CLI (upload de 1 arquivo, limpeza, 504 mantém o arquivo, `--dry-run`, aviso de dimensões) e a leitura de largura x altura do JPEG.
 
 ## Insights orgânicos
 
@@ -86,7 +86,7 @@ Se der 401: o cron rotacionou o token na Vercel, recopie pro `.env.local`.
 
 ## Publicação de mídia
 
-Publica no Instagram pela API oficial (Instagram API with Instagram Login), **numa chamada só**. Hoje: **carrossel** da @eternizacards. Reels e Stories já têm lugar no desenho, mas respondem 501 (ver [o que falta](#o-que-falta-para-reels-e-stories)).
+Publica no Instagram pela API oficial (Instagram API with Instagram Login), **numa chamada só**. Hoje: **carrossel** e **story de imagem** da @eternizacards (ver [Stories](#stories)). Reels e story de vídeo já têm lugar no desenho, mas respondem 501 (ver [o que falta](#o-que-falta-para-reels-e-stories)).
 
 ### Fluxo de negócio
 
@@ -118,6 +118,8 @@ Body:
 
 `confirmar` tem que ser o booleano `true`: `"true"`, `1` ou ausente dá 400.
 
+Story: mesmo body com `"tipo": "STORIES"`, **exatamente 1 item** e **sem `legenda`** (ver [Stories](#stories)).
+
 Ordem do que a rota faz:
 
 1. **Sem tocar no Instagram:** método (405), `PUBLICAR_SECRET` configurado (503), Bearer (401), `confirmar` (400), tipo (400/501), conta (400), itens/URLs/legenda (400), token da conta (503). Qualquer recusa aqui = **zero** chamada ao Graph.
@@ -127,9 +129,11 @@ Ordem do que a rota faz:
 5. `media_publish`.
 6. Permalink. Se falhar aqui, o post **já está no ar**: volta **200 com `aviso`**, pra ninguém repetir achando que não foi.
 
-Resposta 200: `{"mediaId", "permalink", "username", "quota": {"usado", "total"}, "conta", "tipo"}` (+ `aviso` se o permalink falhou).
+No story, os passos 3 e 4 viram **um** container (`image_url` + `media_type: "STORIES"`, sem `caption`) e, no passo 6, ficar sem permalink é normal: volta 200 com `permalink: null` e **sem** `aviso`.
 
-Erros são `{"erro": "...", "publicado": false}`. O `publicado: false` só vem quando o `media_publish` **não foi chamado** (certeza de que nada foi pro perfil). Se o `media_publish` foi chamado e deu erro, o campo **não vem**: resultado indefinido, confira o perfil. Status: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer ou Bearer errado · **405** método errado · **409** container já publicado · **410** container expirou no Instagram · **429** limite de 24h atingido (nada criado) · **501** tipo não implementado · **502** o Instagram recusou ou deu `ERROR` (mensagem do Meta, sem token; nada publicado) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo (nada publicado; a mensagem traz o tempo que a rota realmente esperou e o último status, ex.: `não ficou pronto em 240s (último status: IN_PROGRESS)`).
+Resposta 200: `{"mediaId", "permalink", "username", "quota": {"usado", "total"}, "conta", "tipo"}` (+ `aviso` se o permalink do carrossel falhou).
+
+Erros são `{"erro": "...", "publicado": false}`. O `publicado: false` só vem quando o `media_publish` **não foi chamado** (certeza de que nada foi pro perfil). Se o `media_publish` foi chamado e deu erro, o campo **não vem**: resultado indefinido, confira o perfil. Status: **400** entrada inválida ou `confirmar` diferente de `true` · **401** sem Bearer ou Bearer errado · **405** método errado · **409** container já publicado · **410** container expirou no Instagram · **429** limite de 24h atingido (nada criado) · **501** tipo não implementado (`REELS`, story de vídeo) · **502** o Instagram recusou ou deu `ERROR` (mensagem do Meta, sem token; nada publicado) · **503** `PUBLICAR_SECRET` ou token da conta ausente · **504** container não ficou pronto a tempo (nada publicado; a mensagem traz o tempo que a rota realmente esperou e o último status, ex.: `não ficou pronto em 240s (último status: IN_PROGRESS)`).
 
 ### Limites de tempo
 
@@ -178,6 +182,10 @@ npm run midia:publicar -- carrossel/drop-natal/render --confirmar --conta eterni
 # alternativa: imagens já publicadas em outro lugar (não sobe nem apaga nada)
 node scripts/midia.mjs publicar carrossel/drop-natal/render --base-url https://exemplo.com/c1 --confirmar
 
+# story de 1 imagem (ver "Stories" abaixo)
+node scripts/midia.mjs story carrossel/drop-natal/story.jpg --confirmar --dry-run
+node scripts/midia.mjs story carrossel/drop-natal/story.jpg --confirmar
+
 # apagar os temporários de uma publicação de resultado indefinido (depois de conferir o perfil)
 node scripts/midia.mjs limpar drop-natal-20261115-0105-a1b2c3 --confirmar
 ```
@@ -191,6 +199,40 @@ node scripts/midia.mjs limpar drop-natal-20261115-0105-a1b2c3 --confirmar
 - **Com `--base-url`**: monta as URLs como `<--base-url>/<nome-do-arquivo>`; os JPEGs precisam já estar nesse endereço. Não toca no Storage e não precisa das `SUPABASE_*`.
 - `--dry-run`: não sobe nada e não chama a rota. Mostra os caminhos no bucket, as URLs públicas e o corpo que mandaria. Não exige as credenciais (só avisa se faltarem).
 - Lê `PUBLICAR_SECRET` e `MANYWATA_URL` (padrão `https://manywata.vercel.app`) do ambiente ou do `.env.local`. `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` vêm **só do ambiente**. Nunca imprime segredo nem chave; mensagens de erro passam por `sanitizar()`.
+
+### Stories
+
+Story de **uma imagem**, publicado pela mesma rota (`POST /api/midia/publicar`, `"tipo": "STORIES"`) e pelo mesmo fluxo do carrossel: `confirmar: true`, cota de 24h antes de criar o container, `media_publish`. O alias `/api/carrossel/publicar` continua **só** carrossel (story lá dá 400).
+
+**Formato:**
+- **1 imagem JPEG**, em URL https pública (mesma regra da [hospedagem](#hospedagem-das-imagens)). 2 itens ou mais → 400 (publique um story por vez).
+- **1080x1920** (9:16) é o recomendado. Outro tamanho o Instagram aceita, mas pode cortar ou pôr borda.
+- **Sem legenda.** Story não tem caption na API. Se vier `legenda` não vazia, a rota responde **400** em vez de ignorar, pra ninguém achar que o texto vai aparecer. Texto do story vai **na própria imagem**.
+- **Vídeo ainda não**: item `.mp4`/`.mov`/`.m4v` ou com `video_url` → **501** (ver [o que falta](#o-que-falta-para-reels-e-stories)).
+- **Stickers interativos** (enquete, link, pergunta, menção clicável, música, contagem regressiva) **não são suportados pela API de publicação**: o story sai só com a imagem. Se precisar de sticker, publique pelo app.
+
+  Conferido na documentação oficial da Meta em 15/11/2026: a API de publicação **não suporta stickers em stories**. A doc cita link, enquete e local, e por extensão isso vale também pra caixa de pergunta, quiz, figurinhas/GIF e música. A única exceção é **mencionar usuários pelo parâmetro `user_tags`** (sem sticker), que este código **ainda não implementa**. Outras limitações da publicação: só JPEG, sem shopping tags e sem filtros. Na prática, a interação vai no texto da arte (ex.: "responde no direct"); se quiser sticker, adicione à mão no app. Fontes: [IG User Media, seção "Story Limitations"](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media) ("Publishing stickers (i.e., link, poll, location) is not supported; however mentioning users without a sticker is supported.") e [Content Publishing, seção Limitations](https://developers.facebook.com/docs/instagram-platform/content-publishing/).
+
+**Permalink:** story pode voltar sem permalink (some em 24h e o Graph nem sempre devolve). Isso **não é erro**: a resposta é 200 com `mediaId` e `permalink: null` (ou o link, se vier), sem `aviso`. O `mediaId` já confirma a publicação.
+
+```bash
+curl -sX POST https://manywata.vercel.app/api/midia/publicar \
+  -H "Authorization: Bearer $PUBLICAR_SECRET" -H "Content-Type: application/json" \
+  -d '{"conta": "eterniza", "tipo": "STORIES", "itens": [{"url": "https://exemplo.com/st/promo.jpg"}], "confirmar": true}'
+# → 200 {"mediaId": "...", "permalink": null, "username": "eternizacards", "quota": {...}, "conta": "eterniza", "tipo": "STORIES"}
+```
+
+**CLI:**
+
+```bash
+node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
+```
+
+- **Sem `--confirmar` recusa**, inclusive com `--dry-run`.
+- Antes de qualquer rede: o arquivo precisa começar com `FF D8 FF` (JPEG) e ter **até 8 MB**. Lê largura x altura do cabeçalho do JPEG e **avisa** (não bloqueia) se não for 1080x1920. A leitura não aplica a rotação do EXIF.
+- Sem `--base-url`: sobe pra `instagram-temp/<nome-do-arquivo-sanitizado>-<AAAAMMDD-HHMM>-<aleatório>/<nome-do-arquivo-sanitizado>.jpg`, chama a rota com `tipo: "STORIES"` (sem `legenda` no corpo) e segue **a mesma regra de limpeza do carrossel** ([tabela](#hospedagem-das-imagens)): apaga só com resultado definido; 504, falha de rede, timeout ou resposta indefinida **mantêm** o arquivo e mostram o comando `limpar`.
+- Com `--base-url`: a URL é `<--base-url>/<nome-do-arquivo>`; não toca no Storage.
+- `--dry-run`: não sobe nem chama nada; mostra o caminho no bucket, a URL pública e o corpo.
 
 ### Hospedagem das imagens
 
@@ -253,6 +295,7 @@ Depois de criar: **`vercel --prod` de novo**.
 - **50 posts publicados via API por conta a cada 24h**. A rota checa `content_publishing_limit` antes de criar qualquer container e devolve 429 se a cota acabou.
 - Carrossel: **2 a 10 itens**, imagens **JPEG** em URL pública. Mais de 10 o Meta recusa.
 - Legenda: até **2200 caracteres**, **30 hashtags** e **20 menções (@)**.
+- Story: 1 mídia, sem legenda, recomendado 1080x1920. Stickers interativos não existem na API de publicação.
 - A conta precisa ser profissional (Business/Creator), e o token precisa da permissão `instagram_business_content_publish`.
 
 ### Como funciona por dentro
@@ -264,7 +307,7 @@ Depois de criar: **`vercel --prod` de novo**.
 
 ### O que falta para Reels e Stories
 
-O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `REELS` e `STORIES` com `implementado: false` (a rota responde 501). Pra ligar cada uma:
+O registro `TIPOS` em `api/_lib/instagram-publicacao.js` tem `CAROUSEL` e `STORIES` (só imagem) implementados. `REELS` está com `implementado: false`, e o story de vídeo é recusado com 501 dentro do `validar()` de `STORIES`. Pra ligar o que falta:
 
 **Reels**
 1. `validar()`: exatamente 1 item com URL https de vídeo (MP4/MOV; checar extensão), legenda com `validarLegenda`, `cover_url` opcional (JPEG público, via `validarUrlPublica`), `share_to_feed` opcional (booleano estrito).
@@ -274,13 +317,20 @@ O registro `TIPOS` em `api/_lib/instagram-publicacao.js` já tem as entradas `RE
 5. Hospedagem: o bucket `instagram-temp` só aceita `image/jpeg` até 8 MB. Vídeo vai precisar de outra regra de MIME/tamanho (ou outro bucket), e de manter o arquivo até o container ficar `FINISHED`, que pode levar minutos.
 6. Testes: os mesmos do carrossel trocando os params + o fluxo em duas chamadas.
 
-**Stories**
-1. `validar()`: 1 item com `image_url` (JPEG) **ou** `video_url` (MP4/MOV), nunca os dois. **Sem legenda**: Stories não têm caption, então recusar `legenda` com 400 pra ninguém achar que ela vai aparecer.
-2. `criarContainers()`: `criarContainer({ media_type: "STORIES", image_url | video_url })`.
-3. Imagem cabe no fluxo de uma chamada. Vídeo tem o mesmo problema de tempo do Reels.
-4. Conferir na doc se Stories contam no limite de 50/24h. A rota checa a cota de qualquer jeito.
+**Stories: imagem ✅ pronto** (ver [Stories](#stories)). 1 JPEG, sem legenda (400 se vier), `criarContainer({ image_url, media_type: "STORIES" })`, permalink opcional (`permalinkOpcional: true` no registro).
 
-Os dois exigem a mesma permissão do carrossel. O resto (auth, `confirmar`, limite, sanitização, publish, permalink) já é genérico.
+**Stories: vídeo (falta)**
+1. `validar()`: hoje item com `video_url` ou URL `.mp4`/`.mov`/`.m4v` → 501. Trocar por: aceitar 1 `video_url` https (MP4/MOV), nunca junto com imagem, ainda sem legenda.
+2. `criarContainers()`: `criarContainer({ media_type: "STORIES", video_url })`.
+3. **Tempo**: o mesmo problema do Reels. Processar vídeo pode passar dos 300s da função; precisa do fluxo em duas chamadas (cria o container / checa e publica).
+4. Hospedagem: o mesmo do Reels (bucket só aceita `image/jpeg` até 8 MB). O CLI `story` também só aceita JPEG hoje.
+5. Limites do Meta pra vídeo em story (duração, tamanho): conferir na doc na hora de implementar.
+
+**Pendências gerais**
+- Conferir na doc se Stories contam no limite de 50/24h. A rota checa a cota de qualquer jeito (falha fechada).
+- Stickers interativos: fora do alcance da API de publicação (ver [Stories](#stories)).
+
+Tudo exige a mesma permissão do carrossel (`instagram_business_content_publish`). O resto (auth, `confirmar`, limite, sanitização, publish, permalink) já é genérico.
 
 ## Renovação de token
 

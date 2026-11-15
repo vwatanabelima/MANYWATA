@@ -20,6 +20,7 @@ import { listarSlides, montarUrls, executar } from "../scripts/midia.mjs";
 import {
   MAX_BYTES,
   carimbo,
+  dimensoesJpeg,
   sanitizarSlug,
   slugDaPasta,
   lerCredenciaisStorage,
@@ -100,7 +101,8 @@ function relogio(inicio = T0) {
 // Imita o Graph: cria containers com ids sequenciais (na ordem em que as
 // respostas saem), status configurável. `demora(chamada)` → ms que a chamada
 // leva no relógio falso `rel`; `falharSe(chamada)` → mensagem de erro do Meta.
-function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {}, falharSe = () => null, demora, rel } = {}) {
+// `permalink: null` imita mídia sem permalink (story): o Graph devolve só o id.
+function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {}, falharSe = () => null, demora, rel, permalink = "https://www.instagram.com/p/ABC123/" } = {}) {
   let proximo = 1000;
   const chamadas = [];
   const fetch = vi.fn(async (url, init = {}) => {
@@ -130,7 +132,7 @@ function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {}, f
       const s = status(caminho);
       return ok({ id: caminho, status_code: s, status: s === "ERROR" ? "Error: Media download has failed" : s });
     }
-    if (params.fields === "permalink") return ok({ id: caminho, permalink: "https://www.instagram.com/p/ABC123/" });
+    if (params.fields === "permalink") return ok(permalink ? { id: caminho, permalink } : { id: caminho });
     return ok({ error: { message: "rota não mockada" } }, 400);
   });
   return { fetch, chamadas };
@@ -279,19 +281,20 @@ describe("validação (400, zero fetch)", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test.each(["REELS", "STORIES", "reels"])("tipo %s → 501 e zero fetch", async (tipo) => {
+  test.each(["REELS", "reels"])("tipo %s → 501 e zero fetch", async (tipo) => {
     const { fetch } = meta();
     const res = await publicar({ body: corpo({ tipo }), fetch });
     expect(res.statusCode).toBe(501);
     expect(res.body.erro).toMatch(/não implementado/);
+    expect(res.body.erro).toMatch(/Hoje: CAROUSEL, STORIES/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("registro de tipos: só CAROUSEL implementado", () => {
+  test("registro de tipos: CAROUSEL e STORIES implementados, REELS não", () => {
     expect(Object.keys(TIPOS)).toEqual(["CAROUSEL", "REELS", "STORIES"]);
     expect(TIPOS.CAROUSEL.implementado).toBe(true);
     expect(TIPOS.REELS.implementado).toBe(false);
-    expect(TIPOS.STORIES.implementado).toBe(false);
+    expect(TIPOS.STORIES.implementado).toBe(true);
   });
 });
 
@@ -489,6 +492,203 @@ describe("falhas no Instagram", () => {
     expect(res.body.permalink).toBeNull();
     expect(res.body.aviso).toMatch(/permalink/);
     expect(res.body.aviso).toMatch(/NÃO publique de novo/);
+  });
+});
+
+// ── STORIES (1 imagem JPEG, sem legenda) ──────────────────────────────────
+
+describe("STORIES", () => {
+  const URL_STORY = "https://cdn.exemplo.com/stories/promo-natal.jpg";
+  const corpoStory = (extra = {}) => ({
+    conta: "eterniza",
+    tipo: "STORIES",
+    itens: [{ url: URL_STORY }],
+    confirmar: true,
+    ...extra,
+  });
+
+  test("feliz: limite → container STORIES → FINISHED → media_publish → permalink", async () => {
+    const { fetch, chamadas } = meta({ quota: 7 });
+    const res = await publicar({ body: corpoStory(), fetch });
+
+    expect(res.statusCode).toBe(200);
+    expect(resumo(chamadas)).toEqual([
+      `GET ${USER}/content_publishing_limit`,
+      `POST ${USER}/media`,
+      "GET 1000",
+      `POST ${USER}/media_publish`,
+      "GET 9001",
+    ]);
+    // params EXATOS: sem caption, sem is_carousel_item, sem children
+    expect(chamadas[1].params).toEqual({ image_url: URL_STORY, media_type: "STORIES" });
+    expect(chamadas[1].params).not.toHaveProperty("caption");
+    expect(chamadas[1].params).not.toHaveProperty("is_carousel_item");
+    expect(chamadas[2].params.fields).toBe("status_code,status");
+    expect(chamadas[3].params).toEqual({ creation_id: "1000" });
+    for (const c of chamadas) {
+      expect(c.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+      expect(c.url).not.toContain(TOKEN);
+    }
+    expect(res.body).toEqual({
+      mediaId: "9001",
+      permalink: "https://www.instagram.com/p/ABC123/",
+      username: "eternizacards",
+      quota: { usado: 8, total: 50 },
+      conta: "eterniza",
+      tipo: "STORIES",
+    });
+  });
+
+  test("tipo em minúsculas funciona", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory({ tipo: "stories" }), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.tipo).toBe("STORIES");
+  });
+
+  test("sem permalink no Graph → 200 com mediaId, permalink null e SEM aviso", async () => {
+    const { fetch } = meta({ permalink: null });
+    const res = await publicar({ body: corpoStory(), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.mediaId).toBe("9001");
+    expect(res.body.permalink).toBeNull();
+    expect(res.body).not.toHaveProperty("aviso");
+  });
+
+  test("GET do permalink falha depois de publicar → 200 sem aviso (story não precisa de permalink)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { fetch } = meta({ falhar: { "GET 9001?permalink": "Unsupported get request" } });
+    const res = await publicar({ body: corpoStory(), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.mediaId).toBe("9001");
+    expect(res.body.permalink).toBeNull();
+    expect(res.body).not.toHaveProperty("aviso");
+    expect(warn).not.toHaveBeenCalled();
+    log.mockRestore();
+    warn.mockRestore();
+  });
+
+  test.each([
+    ["2 itens", { itens: [{ url: URL_STORY }, { url: URL_STORY }] }, /exatamente 1 item \(veio 2\)/],
+    ["0 itens", { itens: [] }, /exatamente 1 item \(veio 0\)/],
+    ["itens não é lista", { itens: URL_STORY }, /lista/],
+    ["legenda", { legenda: "Promo de Natal!" }, /story não tem legenda/],
+    ["legenda que não é texto", { legenda: 123 }, /story não tem legenda/],
+    ["png", { itens: [{ url: "https://cdn.exemplo.com/s.png" }] }, /só aceita JPEG/],
+    ["webp", { itens: [{ url: "https://cdn.exemplo.com/s.webp" }] }, /só aceita JPEG/],
+    ["http", { itens: [{ url: "http://cdn.exemplo.com/s.jpg" }] }, /https/],
+    ["IP privado", { itens: [{ url: "https://10.0.0.5/s.jpg" }] }, /não é público/],
+    ["item sem url", { itens: [{}] }, /itens\[0\]\.url/],
+  ])("%s → 400 e zero fetch", async (_n, extra, msg) => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory(extra), fetch });
+    expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(msg);
+    expect(res.body.publicado).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([["ausente", undefined], ["null", null], ["vazia", ""], ["só espaços", "  \n "]])(
+    "legenda %s é aceita e não vira caption",
+    async (_n, legenda) => {
+      const { fetch, chamadas } = meta();
+      const res = await publicar({ body: corpoStory({ legenda }), fetch });
+      expect(res.statusCode).toBe(200);
+      const container = chamadas.find((c) => c.metodo === "POST" && c.caminho === `${USER}/media`);
+      expect(container.params).toEqual({ image_url: URL_STORY, media_type: "STORIES" });
+    }
+  );
+
+  test.each([
+    ["URL .mp4", { itens: [{ url: "https://cdn.exemplo.com/s.mp4" }] }],
+    ["URL .MOV", { itens: [{ url: "https://cdn.exemplo.com/s.MOV" }] }],
+    ["campo video_url", { itens: [{ video_url: "https://cdn.exemplo.com/s.mp4" }] }],
+  ])("story de vídeo (%s) → 501 e zero fetch", async (_n, extra) => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory(extra), fetch });
+    expect(res.statusCode).toBe(501);
+    expect(res.body.erro).toMatch(/story de vídeo ainda não implementado/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("REELS continua 501", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory({ tipo: "REELS" }), fetch });
+    expect(res.statusCode).toBe(501);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("sem PUBLICAR_SECRET → 503 e zero fetch", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory(), env: { IG_ACCESS_TOKEN_ETERNIZA: TOKEN }, fetch });
+    expect(res.statusCode).toBe(503);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("token da conta ausente → 503 e zero fetch", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory(), env: { PUBLICAR_SECRET: SEGREDO }, fetch });
+    expect(res.statusCode).toBe(503);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([["sem header", null], ["segredo errado", "Bearer segredo-errado-com-bem-mais-de-32-caracteres!!"]])(
+    "%s → 401 e zero fetch",
+    async (_n, auth) => {
+      const { fetch } = meta();
+      const res = await publicar({ body: corpoStory(), auth, fetch });
+      expect(res.statusCode).toBe(401);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([["ausente", undefined], ["string 'true'", "true"], ["1", 1]])("confirmar %s → 400 e zero fetch", async (_n, confirmar) => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoStory({ confirmar }), fetch });
+    expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(/confirmar: true/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("cota cheia → 429 sem criar container", async () => {
+    const { fetch, chamadas } = meta({ quota: 50, total: 50 });
+    const res = await publicar({ body: corpoStory(), fetch });
+    expect(res.statusCode).toBe(429);
+    expect(res.body.publicado).toBe(false);
+    expect(resumo(chamadas)).toEqual([`GET ${USER}/content_publishing_limit`]);
+    expect(criouContainer(chamadas)).toBe(false);
+  });
+
+  test("container STORIES com ERROR → 502 sem media_publish, publicado: false", async () => {
+    const { fetch, chamadas } = meta({ status: () => "ERROR" });
+    const res = await publicar({ body: corpoStory(), fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body.publicado).toBe(false);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("container IN_PROGRESS para sempre → 504 sem publicar", async () => {
+    const { fetch, chamadas } = meta({ status: () => "IN_PROGRESS" });
+    const res = await publicar({ body: corpoStory(), fetch, orcamentoMs: 10_000 });
+    expect(res.statusCode).toBe(504);
+    expect(res.body.publicado).toBe(false);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("media_publish recusado → 502 sem o campo publicado (indefinido)", async () => {
+    const { fetch } = meta({ falhar: { [`POST ${USER}/media_publish`]: "Fatal" } });
+    const res = await publicar({ body: corpoStory(), fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toHaveProperty("publicado");
+  });
+
+  test("carrossel continua com aviso quando o permalink falha (só STORIES é opcional)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { fetch } = meta({ falhar: { "GET 9001?permalink": "indisponível" } });
+    const res = await publicar({ fetch });
+    expect(res.body.aviso).toMatch(/NÃO publique de novo/);
+    warn.mockRestore();
   });
 });
 
@@ -720,12 +920,26 @@ describe("arquivos de rota", () => {
     expect(res.body.tipo).toBe("CAROUSEL");
   });
 
-  test("/api/carrossel/publicar com tipo REELS → 400 e zero fetch", async () => {
+  test("/api/midia/publicar publica STORIES", async () => {
+    const { fetch, chamadas } = meta();
+    vi.stubGlobal("fetch", fetch);
+    const res = fakeRes();
+    await rotaMidiaPublicar(
+      fakeReq({ body: { conta: "eterniza", tipo: "STORIES", itens: [{ url: URLS[0] }], confirmar: true } }),
+      res
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.body.tipo).toBe("STORIES");
+    expect(chamadas[1].params).toEqual({ image_url: URLS[0], media_type: "STORIES" });
+  });
+
+  test.each(["REELS", "STORIES"])("/api/carrossel/publicar com tipo %s → 400 e zero fetch", async (tipo) => {
     const { fetch } = meta();
     vi.stubGlobal("fetch", fetch);
     const res = fakeRes();
-    await aliasCarrossel(fakeReq({ body: corpo({ tipo: "REELS" }) }), res);
+    await aliasCarrossel(fakeReq({ body: corpo({ tipo, itens: [{ url: URLS[0] }], legenda: undefined }) }), res);
     expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(/só aceita tipo CAROUSEL/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -1282,6 +1496,250 @@ describe("scripts/midia.mjs com Supabase Storage", () => {
     expect(tudo).toContain("[oculto]");
     expect(tudo).not.toContain(CHAVE);
     expect(tudo).not.toContain(SEGREDO);
+  });
+});
+
+// ── CLI story <arquivo.jpg> (fetch falso, nunca rede) ─────────────────────
+
+// JPEG mínimo com APP0 + SOF0 declarando largura x altura (não precisa
+// decodificar; o CLI só lê o cabeçalho).
+function jpegComDimensoes(largura, altura, extra = 32) {
+  const app0 = [0xff, 0xe0, 0x00, 0x10, ...Buffer.from("JFIF\0"), 1, 1, 0, 0, 1, 0, 1, 0, 0];
+  const sof0 = [0xff, 0xc0, 0x00, 0x11, 0x08, altura >> 8, altura & 0xff, largura >> 8, largura & 0xff, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+  return Buffer.concat([Buffer.from([0xff, 0xd8, ...app0, ...sof0]), Buffer.alloc(extra), Buffer.from([0xff, 0xd9])]);
+}
+
+describe("scripts/midia.mjs story <arquivo.jpg>", () => {
+  const CHAVE = "eyJhbGciOiJIUzI1NiJ9.chave-service-role-de-teste-0123456789";
+  const SUPA = "https://abcdefgh.supabase.co";
+  const ENV_SB = { SUPABASE_URL: SUPA, SUPABASE_SERVICE_ROLE_KEY: CHAVE };
+  const AGORA = () => new Date("2026-11-15T01:05:00Z");
+  const PREFIXO = "promo-natal-20261115-0105-a1b2c3";
+  const CAMINHO = `${PREFIXO}/promo-natal.jpg`;
+  const PUBLICA = `${SUPA}/storage/v1/object/public/instagram-temp/${CAMINHO}`;
+  const respostaOk = { mediaId: "9001", permalink: "https://www.instagram.com/stories/eternizacards/9001/", username: "eternizacards", quota: { usado: 4, total: 50 } };
+
+  let raiz, arquivo;
+  beforeEach(() => {
+    raiz = mkdtempSync(join(tmpdir(), "story-"));
+    arquivo = join(raiz, "Promo Natal!.jpg");
+    writeFileSync(arquivo, jpegComDimensoes(1080, 1920));
+  });
+  afterEach(() => rmSync(raiz, { recursive: true, force: true }));
+
+  function servidor({ falha = () => null, resposta = respostaOk } = {}) {
+    const chamadas = [];
+    const fetch = vi.fn(async (url, init = {}) => {
+      const c = { url, metodo: init.method, headers: init.headers, body: init.body };
+      chamadas.push(c);
+      const f = falha(c);
+      if (f instanceof Error) throw f;
+      if (f) return { ok: f.status < 400, status: f.status, json: async () => f.body ?? {} };
+      if (url.endsWith("/api/midia/publicar")) return { ok: true, status: 200, json: async () => resposta };
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    const tipo = (c) =>
+      c.url.endsWith("/api/midia/publicar") ? "rota" : c.metodo === "DELETE" ? "delete" : c.metodo === "POST" ? "upload" : "?";
+    return { fetch, chamadas, tipos: () => chamadas.map(tipo) };
+  }
+  const ehRota = (c) => c.url.endsWith("/api/midia/publicar");
+  const vars = (extra = {}) => (nome) => ({ PUBLICAR_SECRET: SEGREDO, MANYWATA_URL: "https://manywata.vercel.app", ...extra })[nome];
+  const rodar = (fetch, { argv = ["--confirmar"], alvo = arquivo, env = ENV_SB, lerVar = vars(), ...resto } = {}) =>
+    executar(["story", alvo, ...argv], {
+      fetch,
+      env,
+      lerVar,
+      agora: AGORA,
+      sufixo: "a1b2c3",
+      log: () => {},
+      avisar: () => {},
+      ...resto,
+    });
+
+  test("sobe 1 arquivo, chama a rota com tipo STORIES (sem legenda) e apaga depois", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    const linhas = [];
+    const avisos = [];
+    const r = await rodar(fetch, { log: (l) => linhas.push(l), avisar: (l) => avisos.push(l) });
+
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+
+    const up = chamadas[0];
+    expect(up.url).toBe(`${SUPA}/storage/v1/object/instagram-temp/${CAMINHO}`);
+    expect(up.headers).toEqual({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE, "Content-Type": "image/jpeg", "x-upsert": "false" });
+    expect(Buffer.from(up.body).equals(jpegComDimensoes(1080, 1920))).toBe(true);
+
+    const rota = chamadas[1];
+    expect(rota.url).toBe("https://manywata.vercel.app/api/midia/publicar");
+    expect(rota.headers.Authorization).toBe(`Bearer ${SEGREDO}`);
+    expect(JSON.parse(rota.body)).toEqual({ conta: "eterniza", tipo: "STORIES", itens: [{ url: PUBLICA }], confirmar: true });
+    expect(validarUrlPublica(PUBLICA)).toBe(PUBLICA);
+
+    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
+    const saida = linhas.join("\n");
+    expect(saida).toMatch(/Publicando story \(1 imagem\)/);
+    expect(saida).toContain(respostaOk.permalink);
+    expect(saida).toMatch(/Temporários apagados/);
+    expect(avisos).toEqual([]); // 1080x1920: nada a avisar
+    expect(`${saida}\n${avisos.join("\n")}`).not.toContain(CHAVE);
+  });
+
+  test("--conta é repassada", async () => {
+    const { fetch, chamadas } = servidor();
+    await rodar(fetch, { argv: ["--confirmar", "--conta", "outra"] });
+    expect(JSON.parse(chamadas.find(ehRota).body).conta).toBe("outra");
+  });
+
+  test("story sem permalink → sucesso, mensagem tranquila", async () => {
+    const { fetch } = servidor({ resposta: { ...respostaOk, permalink: null } });
+    const linhas = [];
+    const r = await rodar(fetch, { log: (l) => linhas.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(linhas.join("\n")).toMatch(/story sem permalink; normal/);
+  });
+
+  test.each([
+    ["1080x1080", 1080, 1080],
+    ["1920x1080 (deitada)", 1920, 1080],
+  ])("dimensões %s → avisa mas publica", async (_n, w, h) => {
+    writeFileSync(arquivo, jpegComDimensoes(w, h));
+    const { fetch, tipos } = servidor();
+    const avisos = [];
+    const r = await rodar(fetch, { avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(avisos.join("\n")).toMatch(new RegExp(`${w}x${h}.*recomendado pra story é 1080x1920`));
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+  });
+
+  test("dimensões ilegíveis → avisa mas publica", async () => {
+    writeFileSync(arquivo, Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40)]));
+    const { fetch } = servidor();
+    const avisos = [];
+    await expect(rodar(fetch, { avisar: (l) => avisos.push(l) })).resolves.toMatchObject({ mediaId: "9001" });
+    expect(avisos.join("\n")).toMatch(/não consegui ler as dimensões/);
+  });
+
+  test("sem --confirmar recusa e zero fetch (nem com --dry-run)", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { argv: [] })).rejects.toThrow(/story exige --confirmar/);
+    await expect(rodar(fetch, { argv: ["--dry-run"] })).rejects.toThrow(/story exige --confirmar/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("--dry-run: zero fetch, mostra caminho, URL pública e corpo STORIES sem legenda", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    const r = await rodar(fetch, { argv: ["--confirmar", "--dry-run"], log: (l) => linhas.push(l) });
+    expect(r).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    const saida = linhas.join("\n");
+    expect(saida).toContain(`instagram-temp/${CAMINHO}`);
+    expect(saida).toContain(PUBLICA);
+    expect(saida).toContain('"tipo": "STORIES"');
+    expect(saida).not.toContain("legenda");
+    expect(saida).not.toContain(CHAVE);
+  });
+
+  test("--dry-run sem credenciais nem PUBLICAR_SECRET: zero fetch, só avisa", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    await rodar(fetch, { argv: ["--confirmar", "--dry-run"], env: {}, lerVar: vars({ PUBLICAR_SECRET: undefined }), log: (l) => linhas.push(l) });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(linhas.join("\n")).toMatch(/ausentes[\s\S]*<SUPABASE_URL>\/storage/);
+  });
+
+  test("--base-url: só chama a rota, com <base>/<nome do arquivo>", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    await rodar(fetch, { argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/st"] });
+    expect(tipos()).toEqual(["rota"]);
+    expect(JSON.parse(chamadas[0].body)).toEqual({
+      conta: "eterniza",
+      tipo: "STORIES",
+      itens: [{ url: "https://cdn.exemplo.com/st/Promo%20Natal!.jpg" }],
+      confirmar: true,
+    });
+  });
+
+  test("504 da rota (publicado: false) → NÃO apaga e instrui", async () => {
+    const { fetch, tipos } = servidor({
+      falha: (c) => (ehRota(c) ? { status: 504, body: { erro: "container 1000 não ficou pronto em 240s (último status: IN_PROGRESS). Nada foi publicado.", publicado: false } } : null),
+    });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(/HTTP 504/);
+    expect(e.message).toMatch(/temporários NÃO foram apagados/);
+    expect(e.message).toContain(`instagram-temp/${CAMINHO}`);
+    expect(e.message).toContain(`node scripts/midia.mjs limpar ${PREFIXO} --confirmar`);
+    expect(e.message).toMatch(/rode o mesmo comando de novo/);
+    expect(tipos()).not.toContain("delete");
+  });
+
+  test("falha de rede na rota → NÃO apaga", async () => {
+    const { fetch, tipos } = servidor({ falha: (c) => (ehRota(c) ? new TypeError("fetch failed") : null) });
+    await expect(rodar(fetch)).rejects.toThrow(/Pode ter publicado mesmo assim/);
+    expect(tipos()).toEqual(["upload", "rota"]);
+  });
+
+  test("400 da rota com publicado: false → apaga", async () => {
+    const { fetch, chamadas, tipos } = servidor({
+      falha: (c) => (ehRota(c) ? { status: 400, body: { erro: "story não tem legenda", publicado: false } } : null),
+    });
+    await expect(rodar(fetch)).rejects.toThrow(/HTTP 400[\s\S]*Nada foi publicado/);
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
+  });
+
+  test("não é JPEG → erro e zero fetch", async () => {
+    writeFileSync(arquivo, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/Promo Natal!\.jpg não é JPEG/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("> 8 MB → erro e zero fetch", async () => {
+    writeFileSync(arquivo, Buffer.concat([jpegComDimensoes(1080, 1920), Buffer.alloc(MAX_BYTES)]));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/limite do bucket é 8 MB/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("arquivo inexistente / sem arquivo → erro claro e zero fetch", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { alvo: join(raiz, "nao-existe.jpg") })).rejects.toThrow(/Não consegui ler o arquivo/);
+    await expect(rodar(fetch, { alvo: raiz })).rejects.toThrow(/Não consegui ler o arquivo/);
+    await expect(executar(["story", "--confirmar"], { fetch, lerVar: vars() })).rejects.toThrow(/Falta o arquivo JPEG/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("sem SUPABASE_* ou sem PUBLICAR_SECRET → recusa e zero fetch", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { env: {} })).rejects.toThrow(/SUPABASE_URL/);
+    await expect(rodar(fetch, { lerVar: vars({ PUBLICAR_SECRET: undefined }) })).rejects.toThrow(/PUBLICAR_SECRET/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("nome de arquivo sem letras vira slug 'story'", async () => {
+    const outro = join(raiz, "!!!.jpg");
+    writeFileSync(outro, jpegComDimensoes(1080, 1920));
+    const { fetch, chamadas } = servidor();
+    await rodar(fetch, { alvo: outro });
+    expect(chamadas[0].url).toBe(`${SUPA}/storage/v1/object/instagram-temp/story-20261115-0105-a1b2c3/story.jpg`);
+  });
+});
+
+describe("dimensoesJpeg", () => {
+  test("lê largura x altura do SOF0 e do SOF2 (progressivo)", () => {
+    expect(dimensoesJpeg(jpegComDimensoes(1080, 1920))).toEqual({ largura: 1080, altura: 1920 });
+    const prog = jpegComDimensoes(640, 480);
+    prog[prog.indexOf(0xc0, 4)] = 0xc2;
+    expect(dimensoesJpeg(prog)).toEqual({ largura: 640, altura: 480 });
+  });
+
+  test("não é JPEG, truncado ou sem SOF → null", () => {
+    expect(dimensoesJpeg(Buffer.from([0x89, 0x50, 0x4e, 0x47]))).toBeNull();
+    expect(dimensoesJpeg(Buffer.from([0xff, 0xd8, 0xff]))).toBeNull();
+    expect(dimensoesJpeg(jpegComDimensoes(1080, 1920).subarray(0, 25))).toBeNull(); // corta no meio do SOF
+    expect(dimensoesJpeg(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(40)]))).toBeNull();
   });
 });
 
