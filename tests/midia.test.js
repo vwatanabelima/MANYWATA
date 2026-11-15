@@ -2,12 +2,18 @@
 // fetch falso: nenhum teste chama o Instagram de verdade.
 
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotaPublicar } from "../api/_lib/rotas-midia.js";
 import { sanitizar, validarUrlPublica, ErroHttp } from "../api/_lib/seguranca.js";
-import { TIPOS, validarLegenda } from "../api/_lib/instagram-publicacao.js";
+import { TIPOS, validarLegenda, criarPublicador, emParalelo } from "../api/_lib/instagram-publicacao.js";
+import {
+  MAX_DURATION_S,
+  ORCAMENTO_CONTAINERS_MS,
+  STATUS_ESPERA_MINIMA_MS,
+  CLI_TIMEOUT_ROTA_MS,
+} from "../api/_lib/tempos.js";
 import rotaMidiaPublicar from "../api/midia/publicar.js";
 import aliasCarrossel from "../api/carrossel/publicar.js";
 import { listarSlides, montarUrls, executar } from "../scripts/midia.mjs";
@@ -55,16 +61,46 @@ function fakeReq({ method = "POST", body, auth = `Bearer ${SEGREDO}` } = {}) {
   };
 }
 
-// Relógio falso: sleep só avança o tempo, ninguém espera de verdade.
+// Relógio falso com agenda (simulação de eventos discretos). sleep(ms) só
+// resolve quando o tempo falso chega lá, e esperas em paralelo andam juntas
+// (três sleeps de 2s em Promise.all levam 2s, não 6s). Ninguém espera de
+// verdade: quando tudo que podia andar já andou (microtasks drenadas), o
+// relógio pula pro próximo timer. `passar` é a mesma espera sem o espião,
+// pros fakes simularem chamadas lentas sem contar como sleep da rota.
 function relogio(inicio = T0) {
   const r = { t: inicio };
+  const timers = [];
+  let seq = 0;
+  let agendado = false;
+  const disparar = () => {
+    agendado = false;
+    if (!timers.length) return;
+    timers.sort((a, b) => a.at - b.at || a.seq - b.seq);
+    const prox = timers.shift();
+    r.t = Math.max(r.t, prox.at);
+    prox.resolve();
+    agendar();
+  };
+  const agendar = () => {
+    if (!agendado && timers.length) {
+      agendado = true;
+      setImmediate(disparar);
+    }
+  };
   r.now = () => r.t;
-  r.sleep = vi.fn(async (ms) => { r.t += ms; });
+  r.passar = (ms) =>
+    new Promise((resolve) => {
+      timers.push({ at: r.t + Math.max(0, ms), seq: seq++, resolve });
+      agendar();
+    });
+  r.sleep = vi.fn((ms) => r.passar(ms));
   return r;
 }
 
-// Imita o Graph: cria containers com ids sequenciais, status configurável.
-function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {} } = {}) {
+// Imita o Graph: cria containers com ids sequenciais (na ordem em que as
+// respostas saem), status configurável. `demora(chamada)` → ms que a chamada
+// leva no relógio falso `rel`; `falharSe(chamada)` → mensagem de erro do Meta.
+function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {}, falharSe = () => null, demora, rel } = {}) {
   let proximo = 1000;
   const chamadas = [];
   const fetch = vi.fn(async (url, init = {}) => {
@@ -72,12 +108,20 @@ function meta({ status = () => "FINISHED", quota = 0, total = 50, falhar = {} } 
     const metodo = init.method || "GET";
     const caminho = u.pathname.replace(/^\/v21\.0\//, "");
     const params = metodo === "GET" ? Object.fromEntries(u.searchParams) : JSON.parse(init.body);
-    chamadas.push({ metodo, caminho, params, url, headers: init.headers });
+    const chamada = { metodo, caminho, params, url, headers: init.headers, em: rel?.t };
+    chamadas.push(chamada);
+    const ms = demora?.(chamada) ?? 0;
+    if (ms > 0) await rel.passar(ms);
     const ok = (body, st = 200) => ({ ok: st < 400, status: st, json: async () => body });
     const chave = `${metodo} ${caminho}${params.fields ? `?${params.fields}` : ""}`;
     if (falhar[chave]) return ok({ error: { message: falhar[chave] } }, 400);
+    const msg = falharSe(chamada);
+    if (msg) return ok({ error: { message: msg } }, 400);
 
-    if (metodo === "POST" && caminho === `${USER}/media`) return ok({ id: String(proximo++) });
+    if (metodo === "POST" && caminho === `${USER}/media`) {
+      chamada.id = String(proximo++);
+      return ok({ id: chamada.id });
+    }
     if (metodo === "POST" && caminho === `${USER}/media_publish`) return ok({ id: "9001" });
     if (caminho === `${USER}/content_publishing_limit`) {
       return ok({ data: [{ quota_usage: quota, config: { quota_total: total } }] });
@@ -392,12 +436,27 @@ describe("falhas no Instagram", () => {
     expect(publicou(chamadas)).toBe(false);
   });
 
-  test("orçamento padrão cabe nos 60s da função", async () => {
-    const { fetch } = meta({ status: () => "IN_PROGRESS" });
+  // Antes: "cabe nos 60s da função" com orçamento de 45s. Agora a função tem
+  // MAX_DURATION_S (300s) e o orçamento é ORCAMENTO_CONTAINERS_MS (240s).
+  test("orçamento padrão: espera o orçamento inteiro e ainda cabe no maxDuration com folga", async () => {
+    const { fetch, chamadas } = meta({ status: () => "IN_PROGRESS" });
     const rel = relogio();
     const res = await publicar({ fetch, ...rel });
     expect(res.statusCode).toBe(504);
-    expect(rel.t - T0).toBeLessThanOrEqual(50_000);
+    expect(res.body.publicado).toBe(false);
+    expect(rel.t - T0).toBeGreaterThanOrEqual(ORCAMENTO_CONTAINERS_MS);
+    expect(rel.t - T0).toBeLessThanOrEqual(MAX_DURATION_S * 1000 - 30_000);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("504 de timeout: mensagem com o tempo real e o último status, nunca negativa", async () => {
+    const { fetch } = meta({ status: () => "IN_PROGRESS" });
+    const rel = relogio();
+    const res = await publicar({ fetch, ...rel, orcamentoMs: 10_000 });
+    expect(res.statusCode).toBe(504);
+    expect(res.body.erro).toMatch(/slide \d de 3: container \d+ não ficou pronto em 10s \(último status: IN_PROGRESS\)/);
+    expect(res.body.erro).not.toMatch(/em -?0s|em -\d/);
+    expect(res.body.publicado).toBe(false);
   });
 
   test("container EXPIRED → 410 sem publicar", async () => {
@@ -430,6 +489,204 @@ describe("falhas no Instagram", () => {
     expect(res.body.permalink).toBeNull();
     expect(res.body.aviso).toMatch(/permalink/);
     expect(res.body.aviso).toMatch(/NÃO publique de novo/);
+  });
+});
+
+// ── Criação lenta e paralelismo (bug de 2026-11-15) ───────────────────────
+//
+// Produção: carrossel de 9 slides deu 504 "não ficou pronto em 0s" / "em -2s".
+// Os 9 POST /media eram em sequência, cada um levando segundos (o Meta baixa
+// a imagem antes de responder), e comiam o orçamento de 45s inteiro.
+
+describe("carrossel com criação lenta", () => {
+  const NOVE = Array.from({ length: 9 }, (_, i) => `https://cdn.exemplo.com/render/slide-${String(i + 1).padStart(2, "0")}.jpg`);
+  const corpo9 = () => corpo({ itens: NOVE.map((url) => ({ url })) });
+  const postMedia = (c) => c.metodo === "POST" && c.caminho === `${USER}/media`;
+  const filhos = (chamadas) => chamadas.filter((c) => postMedia(c) && c.params.is_carousel_item);
+
+  // Padrão e o orçamento antigo (45s): em paralelo, os dois passam.
+  test.each([
+    ["orçamento padrão", undefined],
+    ["orçamento antigo de 45s", 45_000],
+  ])("9 slides, cada POST /media demorando 6s → publica (%s)", async (_n, orcamentoMs) => {
+    const rel = relogio();
+    const { fetch, chamadas } = meta({ rel, demora: (c) => (postMedia(c) ? 6_000 : 0) });
+    const res = await publicar({ body: corpo9(), fetch, ...rel, ...(orcamentoMs ? { orcamentoMs } : {}) });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body.mediaId).toBe("9001");
+    // os 9 filhos saíram juntos, no mesmo instante
+    expect(filhos(chamadas)).toHaveLength(9);
+    expect(new Set(filhos(chamadas).map((c) => c.em))).toEqual(new Set([T0]));
+    // 6s dos filhos + 6s do CAROUSEL; em sequência seriam 54s + 6s
+    expect(rel.t - T0).toBe(12_000);
+    // nenhum aguardarStatus precisou dormir (já estavam FINISHED)
+    expect(rel.sleep).not.toHaveBeenCalled();
+  });
+
+  test("children na ordem dos slides mesmo com as respostas chegando fora de ordem", async () => {
+    const rel = relogio();
+    // slide 1 é o mais lento, slide 9 o mais rápido → ids saem invertidos
+    const demora = (c) => (postMedia(c) && c.params.is_carousel_item ? (10 - NOVE.indexOf(c.params.image_url)) * 1_000 : 0);
+    const { fetch, chamadas } = meta({ rel, demora });
+    const res = await publicar({ body: corpo9(), fetch, ...rel });
+
+    expect(res.statusCode).toBe(200);
+    const idPorUrl = Object.fromEntries(filhos(chamadas).map((c) => [c.params.image_url, c.id]));
+    expect(idPorUrl[NOVE[0]]).toBe("1008"); // o último a responder
+    expect(idPorUrl[NOVE[8]]).toBe("1000"); // o primeiro a responder
+    const carrossel = chamadas.find((c) => c.params.media_type === "CAROUSEL");
+    expect(carrossel.params.children).toBe(NOVE.map((u) => idPorUrl[u]).join(","));
+    expect(carrossel.params.children).toBe("1008,1007,1006,1005,1004,1003,1002,1001,1000");
+  });
+
+  test("um filho recusado na criação → erro com o número do slide, sem CAROUSEL nem publish", async () => {
+    const rel = relogio();
+    const { fetch, chamadas } = meta({
+      rel,
+      demora: (c) => (postMedia(c) ? 3_000 : 0),
+      falharSe: (c) => (c.params.image_url === NOVE[4] ? "Only photo or video can be accepted as media type." : null),
+    });
+    const res = await publicar({ body: corpo9(), fetch, ...rel });
+    expect(res.statusCode).toBe(502);
+    expect(res.body.erro).toMatch(/^slide 5 de 9: Instagram recusou POST .*Only photo or video/);
+    expect(res.body.publicado).toBe(false);
+    expect(chamadas.some((c) => c.params.media_type === "CAROUSEL")).toBe(false);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("filho com ERROR cancela a espera dos outros e nada fica rodando depois da resposta", async () => {
+    const rel = relogio();
+    const { fetch, chamadas } = meta({ rel, status: (id) => (id === "1001" ? "ERROR" : "IN_PROGRESS") });
+    const res = await publicar({ fetch, ...rel });
+    expect(res.statusCode).toBe(502);
+    expect(res.body.erro).toMatch(/^slide 2 de 3: container 1001 falhou no Instagram \(ERROR\)/);
+    expect(res.body.publicado).toBe(false);
+    // não esperou o orçamento: parou na volta seguinte do polling
+    expect(rel.t - T0).toBeLessThanOrEqual(5_000);
+    const total = chamadas.length;
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    expect(chamadas.length).toBe(total);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("emParalelo devolve na ordem das tarefas, não na de conclusão", async () => {
+    const rel = relogio();
+    const r = await emParalelo([3, 1, 2].map((s) => () => rel.passar(s * 1000).then(() => s)));
+    expect(r).toEqual([3, 1, 2]);
+    expect(rel.t - T0).toBe(3_000);
+  });
+});
+
+// ── aguardarStatus ────────────────────────────────────────────────────────
+
+describe("aguardarStatus", () => {
+  // Graph falso só pro GET de status; `lento` = ms que cada GET leva.
+  function cliente({ statuses = () => "IN_PROGRESS", lento = 0 } = {}) {
+    const rel = relogio();
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      if (lento) await rel.passar(lento);
+      const s = statuses(n++);
+      return { ok: true, status: 200, json: async () => ({ status_code: s }) };
+    });
+    const pub = criarPublicador({ userId: USER, token: TOKEN, fetch, sleep: rel.sleep, now: rel.now });
+    return { pub, fetch, rel };
+  }
+
+  test.each([0, -2_000])("orçamento %i: ainda checa de verdade, espera o mínimo e só então desiste", async (timeoutMs) => {
+    const { pub, fetch, rel } = cliente();
+    const e = await pub.aguardarStatus("555", { timeoutMs }).catch((x) => x);
+    expect(e).toBeInstanceOf(ErroHttp);
+    expect(e.status).toBe(504);
+    expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(rel.t - T0).toBeGreaterThanOrEqual(STATUS_ESPERA_MINIMA_MS);
+    expect(e.message).toBe("container 555 não ficou pronto em 10s (último status: IN_PROGRESS). Nada foi publicado.");
+  });
+
+  test("orçamento 0 mas fica FINISHED na 2ª checagem → resolve", async () => {
+    const { pub, fetch, rel } = cliente({ statuses: (n) => (n === 0 ? "IN_PROGRESS" : "FINISHED") });
+    await expect(pub.aguardarStatus("555", { timeoutMs: 0 })).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(rel.sleep).toHaveBeenCalledTimes(1);
+  });
+
+  test("já FINISHED na primeira checagem: uma GET e nenhum sleep", async () => {
+    const { pub, fetch, rel } = cliente({ statuses: () => "FINISHED" });
+    await pub.aguardarStatus("555", { timeoutMs: 0 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(rel.sleep).not.toHaveBeenCalled();
+  });
+
+  test("mensagem usa o tempo REAL decorrido (GET lento de 4s), não o orçamento", async () => {
+    const { pub, fetch } = cliente({ lento: 4_000 });
+    const e = await pub.aguardarStatus("555", { timeoutMs: 0 }).catch((x) => x);
+    // 0→4 GET, dorme 2 → 6, GET → 10 (2 checagens), dorme 3 → 13, GET → 17
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(e.message).toMatch(/não ficou pronto em 17s \(último status: IN_PROGRESS\)/);
+  });
+
+  test("polling começa em 2s e cresce até 5s, sem passar do orçamento", async () => {
+    const { pub, rel } = cliente();
+    const e = await pub.aguardarStatus("555", { timeoutMs: 30_000 }).catch((x) => x);
+    const sonos = rel.sleep.mock.calls.map(([ms]) => ms);
+    expect(sonos.slice(0, 4)).toEqual([2_000, 3_000, 4_500, 5_000]);
+    expect(Math.max(...sonos)).toBe(5_000);
+    expect(rel.t - T0).toBe(30_000);
+    expect(e.message).toMatch(/em 30s/);
+  });
+
+  test("status sem status_code: mensagem diz 'desconhecido'", async () => {
+    const { pub } = cliente({ statuses: () => undefined });
+    const e = await pub.aguardarStatus("555", { timeoutMs: 0 }).catch((x) => x);
+    expect(e.message).toMatch(/último status: desconhecido/);
+  });
+});
+
+// ── publicado: false ──────────────────────────────────────────────────────
+
+describe("campo publicado nas respostas de erro", () => {
+  test.each([
+    ["400 de validação", { body: corpo({ confirmar: false }) }, 400],
+    ["429 de cota", { fetch: meta({ quota: 50 }).fetch }, 429],
+    ["502 de container ERROR", { fetch: meta({ status: () => "ERROR" }).fetch }, 502],
+    ["504 de timeout", { fetch: meta({ status: () => "IN_PROGRESS" }).fetch, orcamentoMs: 5_000 }, 504],
+  ])("%s → publicado: false (media_publish nunca chamado)", async (_n, opcoes, status) => {
+    const res = await publicar({ fetch: meta().fetch, ...opcoes });
+    expect(res.statusCode).toBe(status);
+    expect(res.body.publicado).toBe(false);
+  });
+
+  test("media_publish chamado e recusado → sem o campo publicado (resultado indefinido)", async () => {
+    const res = await publicar({ fetch: meta({ falhar: { [`POST ${USER}/media_publish`]: "Fatal" } }).fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toHaveProperty("publicado");
+  });
+
+  test("media_publish com falha de rede → sem o campo publicado", async () => {
+    const { fetch: base } = meta();
+    const fetch = vi.fn(async (url, init) => {
+      if (url.endsWith("/media_publish")) throw new TypeError("fetch failed");
+      return base(url, init);
+    });
+    const res = await publicar({ fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toHaveProperty("publicado");
+  });
+});
+
+// ── Tempos (vercel.json ↔ api/_lib/tempos.js) ─────────────────────────────
+
+describe("tempos", () => {
+  test("vercel.json usa MAX_DURATION_S nas duas rotas de mídia", () => {
+    const cfg = JSON.parse(readFileSync(new URL("../vercel.json", import.meta.url), "utf8"));
+    expect(cfg.functions["api/midia/*.js"].maxDuration).toBe(MAX_DURATION_S);
+    expect(cfg.functions["api/carrossel/*.js"].maxDuration).toBe(MAX_DURATION_S);
+  });
+
+  test("orçamento + duas esperas mínimas + 30s de folga cabem no maxDuration; CLI espera mais que a função", () => {
+    expect(ORCAMENTO_CONTAINERS_MS + 2 * STATUS_ESPERA_MINIMA_MS + 30_000).toBeLessThanOrEqual(MAX_DURATION_S * 1000);
+    expect(CLI_TIMEOUT_ROTA_MS).toBeGreaterThan(MAX_DURATION_S * 1000);
   });
 });
 
@@ -666,6 +923,12 @@ describe("scripts/midia.mjs", () => {
     ).rejects.toThrow(/HTTP 429: limite/);
   });
 
+  test("o fetch pra rota leva um AbortSignal (timeout do CLI)", async () => {
+    const fetch = fetchServidor();
+    await executar(["publicar", pasta, "--base-url", "https://cdn.exemplo.com/c1", "--confirmar"], { fetch, lerVar: vars(), log: () => {} });
+    expect(fetch.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+
   test("falha de rede avisa pra conferir o perfil antes de repetir", async () => {
     const fetch = vi.fn(async () => { throw new TypeError("fetch failed"); });
     await expect(
@@ -723,7 +986,17 @@ describe("scripts/midia.mjs com Supabase Storage", () => {
       chamadas.push(c);
       const f = falha(c, chamadas);
       if (f instanceof Error) throw f;
-      if (f) return { ok: false, status: f.status, json: async () => f.body ?? {} };
+      // body null = corpo que não é JSON (ex.: página HTML de erro da Vercel)
+      if (f) {
+        return {
+          ok: f.status < 400,
+          status: f.status,
+          json: async () => {
+            if (f.body === null) throw new SyntaxError("Unexpected token '<'");
+            return f.body ?? {};
+          },
+        };
+      }
       if (url.endsWith("/api/midia/publicar")) return { ok: true, status: 200, json: async () => respostaOk };
       return { ok: true, status: 200, json: async () => ({}) };
     });
@@ -854,25 +1127,64 @@ describe("scripts/midia.mjs com Supabase Storage", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("rota devolve erro (429) → apaga tudo o que subiu", async () => {
+  // Resultado DEFINIDO (a rota diz publicado: false e não é 504) → apaga.
+  // Antes o 429 vinha só com {erro}; agora a rota manda publicado: false e o
+  // CLI exige esse campo pra apagar.
+  test.each([
+    [429, "limite de publicação atingido (50/50)"],
+    [400, "itens[0].url: só https é aceito"],
+    [502, "slide 3 de 3: container 1002 falhou no Instagram (ERROR)"],
+  ])("rota devolve %i com publicado: false → apaga tudo o que subiu", async (status, erro) => {
     const { fetch, chamadas, tipos } = servidor({
-      falha: (c) => (ehRota(c) ? { status: 429, body: { erro: "limite de publicação atingido (50/50)" } } : null),
+      falha: (c) => (ehRota(c) ? { status, body: { erro, publicado: false } } : null),
     });
-    await expect(rodar(fetch)).rejects.toThrow(/HTTP 429: limite/);
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(new RegExp(`^HTTP ${status}: `));
+    expect(e.message).toMatch(/Nada foi publicado/);
+    expect(e.message).not.toMatch(/limpar/);
     expect(tipos()).toEqual(["upload", "upload", "upload", "rota", "delete"]);
     expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
   });
 
-  test("rota 504 sem detalhe (incerto) → apaga e manda conferir o perfil", async () => {
-    const { fetch, chamadas } = servidor({ falha: (c) => (ehRota(c) ? { status: 504 } : null) });
-    await expect(rodar(fetch)).rejects.toThrow(/confira o perfil ANTES de rodar de novo/);
-    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+  // Resultado INDEFINIDO → NÃO apaga, imprime os caminhos e o que fazer.
+  // Antes estes casos apagavam ("o Meta já baixou"); mas o Meta pode ainda
+  // estar processando os containers quando o CLI recebe o erro.
+  const fetchQueRespeitaAbort = () =>
+    vi.fn((url, init) =>
+      url.endsWith("/api/midia/publicar")
+        ? new Promise((_, rejeitar) => init.signal.addEventListener("abort", () => rejeitar(init.signal.reason)))
+        : Promise.resolve({ ok: true, status: 200, json: async () => ({}) })
+    );
+
+  test.each([
+    ["504 sem corpo (timeout da Vercel)", { status: 504 }, /HTTP 504: sem detalhe[\s\S]*Resposta sem detalhe[\s\S]*confira o perfil ANTES de rodar de novo/],
+    ["504 da rota com publicado: false", { status: 504, body: { erro: "slide 1 de 3: container 1000 não ficou pronto em 240s (último status: IN_PROGRESS). Nada foi publicado.", publicado: false } }, /HTTP 504: slide 1[\s\S]*não chegou a publicar/],
+    ["502 sem publicado (media_publish chamado)", { status: 502, body: { erro: "Instagram recusou POST x/media_publish: Fatal" } }, /HTTP 502: Instagram recusou[\s\S]*pode ter publicado/],
+    ["500 com HTML", { status: 500, body: null }, /HTTP 500: sem detalhe/],
+    ["200 sem mediaId", { status: 200, body: {} }, /HTTP 200 sem mediaId[\s\S]*pode ter publicado/],
+    ["falha de rede", new TypeError("fetch failed"), /Falha de rede chamando[\s\S]*Pode ter publicado mesmo assim: confira o perfil/],
+  ])("%s → NÃO apaga e imprime caminhos + instrução", async (_n, resposta, msg) => {
+    const { fetch, tipos } = servidor({ falha: (c) => (ehRota(c) ? resposta : null) });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(msg);
+    expect(e.message).toMatch(/temporários NÃO foram apagados/);
+    for (const c of CAMINHOS) expect(e.message).toContain(`instagram-temp/${c}`);
+    expect(e.message).toContain(`node scripts/midia.mjs limpar ${PREFIXO} --confirmar`);
+    expect(e.message).toMatch(/Confira o perfil/);
+    expect(tipos()).not.toContain("delete");
   });
 
-  test("falha de rede na rota (incerto) → apaga e manda conferir o perfil", async () => {
-    const { fetch, chamadas } = servidor({ falha: (c) => (ehRota(c) ? new TypeError("fetch failed") : null) });
-    await expect(rodar(fetch)).rejects.toThrow(/Pode ter publicado mesmo assim: confira o perfil/);
-    expect(prefixesApagados(chamadas)).toEqual(CAMINHOS);
+  test("timeout do CLI (abort) → NÃO apaga e explica", async () => {
+    const fetch = fetchQueRespeitaAbort();
+    const e = await rodar(fetch, { timeoutRotaMs: 20 }).catch((x) => x);
+    expect(e.message).toMatch(/Sem resposta de https:\/\/manywata\.vercel\.app\/api\/midia\/publicar em 0s \(timeout do CLI\)/);
+    expect(e.message).toContain(`limpar ${PREFIXO} --confirmar`);
+    expect(fetch.mock.calls.some(([, init]) => init.method === "DELETE")).toBe(false);
+  });
+
+  test("timeout padrão do CLI é maior que o maxDuration da função", () => {
+    expect(CLI_TIMEOUT_ROTA_MS).toBe(330_000);
+    expect(CLI_TIMEOUT_ROTA_MS).toBeGreaterThan(MAX_DURATION_S * 1000);
   });
 
   test("upload parcial (2º recusado) → não chama a rota e apaga o que foi tentado", async () => {
@@ -907,7 +1219,7 @@ describe("scripts/midia.mjs com Supabase Storage", () => {
         c.metodo === "DELETE"
           ? new TypeError("fetch failed")
           : ehRota(c)
-            ? { status: 400, body: { erro: "itens[0].url inválida" } }
+            ? { status: 400, body: { erro: "itens[0].url inválida", publicado: false } } // antes sem publicado
             : null,
     });
     const avisos = [];
@@ -970,6 +1282,86 @@ describe("scripts/midia.mjs com Supabase Storage", () => {
     expect(tudo).toContain("[oculto]");
     expect(tudo).not.toContain(CHAVE);
     expect(tudo).not.toContain(SEGREDO);
+  });
+});
+
+describe("scripts/midia.mjs limpar <prefixo>", () => {
+  const CHAVE = "eyJhbGciOiJIUzI1NiJ9.chave-service-role-de-teste-0123456789";
+  const SUPA = "https://abcdefgh.supabase.co";
+  const ENV_SB = { SUPABASE_URL: SUPA, SUPABASE_SERVICE_ROLE_KEY: CHAVE };
+  const PREFIXO = "drop-natal-cartas-20261115-0105-a1b2c3";
+
+  // Storage falso: listagem devolve `arquivos` (+ uma subpasta, id null).
+  function storage({ arquivos = ["slide-01.jpg", "slide-02.jpg"], falha = () => null } = {}) {
+    const chamadas = [];
+    const fetch = vi.fn(async (url, init = {}) => {
+      const c = { url, metodo: init.method, headers: init.headers, body: init.body ? JSON.parse(init.body) : undefined };
+      chamadas.push(c);
+      const f = falha(c);
+      if (f instanceof Error) throw f;
+      if (f) return { ok: false, status: f.status, json: async () => f.body ?? {} };
+      if (url.includes("/object/list/")) {
+        return { ok: true, status: 200, json: async () => [...arquivos.map((name) => ({ name, id: `id-${name}` })), { name: "sub", id: null }] };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    return { fetch, chamadas };
+  }
+  const rodar = (argv, { fetch, env = ENV_SB, log = () => {} } = {}) => executar(["limpar", ...argv], { fetch, env, log, lerVar: () => undefined });
+
+  test("sem --confirmar → recusa e zero fetch", async () => {
+    const { fetch } = storage();
+    await expect(rodar([PREFIXO], { fetch })).rejects.toThrow(/limpar exige --confirmar/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["vazio", []],
+    ["com barra no meio", ["drop/natal", "--confirmar"]],
+    ["com ..", ["..", "--confirmar"]],
+    ["com maiúsculas", ["Drop-Natal", "--confirmar"]],
+    ["só o bucket", ["instagram-temp/", "--confirmar"]],
+  ])("prefixo %s → recusa e zero fetch", async (_n, argv) => {
+    const { fetch } = storage();
+    await expect(rodar(argv, { fetch })).rejects.toThrow(/prefixo/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("sem SUPABASE_* no ambiente → recusa e zero fetch", async () => {
+    const { fetch } = storage();
+    await expect(rodar([PREFIXO, "--confirmar"], { fetch, env: {} })).rejects.toThrow(/SUPABASE_URL/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([PREFIXO, `${PREFIXO}/`, `instagram-temp/${PREFIXO}/`])("com --confirmar (%s): lista a pasta e apaga só os arquivos dela", async (alvo) => {
+    const { fetch, chamadas } = storage();
+    const linhas = [];
+    const r = await rodar([alvo, "--confirmar"], { fetch, log: (l) => linhas.push(l) });
+    expect(chamadas.map((c) => `${c.metodo} ${c.url}`)).toEqual([
+      `POST ${SUPA}/storage/v1/object/list/instagram-temp`,
+      `DELETE ${SUPA}/storage/v1/object/instagram-temp`,
+    ]);
+    expect(chamadas[0].body).toMatchObject({ prefix: PREFIXO, offset: 0 });
+    expect(chamadas[0].headers).toMatchObject({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE });
+    expect(chamadas[1].body).toEqual({ prefixes: [`${PREFIXO}/slide-01.jpg`, `${PREFIXO}/slide-02.jpg`] });
+    expect(r.apagados).toHaveLength(2);
+    expect(linhas.join("\n")).toMatch(/Apagados 2 arquivo/);
+    expect(linhas.join("\n")).not.toContain(CHAVE);
+  });
+
+  test("pasta vazia → não chama DELETE", async () => {
+    const { fetch, chamadas } = storage({ arquivos: [] });
+    const linhas = [];
+    await rodar([PREFIXO, "--confirmar"], { fetch, log: (l) => linhas.push(l) });
+    expect(chamadas.map((c) => c.metodo)).toEqual(["POST"]);
+    expect(linhas.join("\n")).toMatch(/Nada pra apagar/);
+  });
+
+  test("erro do Storage vira mensagem sanitizada", async () => {
+    const { fetch } = storage({ falha: (c) => (c.metodo === "DELETE" ? { status: 500, body: { message: `ruim ${CHAVE}` } } : null) });
+    const e = await rodar([PREFIXO, "--confirmar"], { fetch }).catch((x) => x);
+    expect(e.message).toMatch(/Storage recusou apagar \(HTTP 500\): ruim \[oculto\]/);
+    expect(e.message).not.toContain(CHAVE);
   });
 });
 

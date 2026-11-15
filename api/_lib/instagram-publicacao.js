@@ -14,6 +14,12 @@
 // mensagem de erro passa por sanitizar().
 
 import { ErroHttp, sanitizar, validarUrlPublica } from "./seguranca.js";
+import {
+  STATUS_CHECAGENS_MINIMAS,
+  STATUS_ESPERA_MINIMA_MS,
+  STATUS_INTERVALO_INICIAL_MS,
+  STATUS_INTERVALO_MAX_MS,
+} from "./tempos.js";
 
 export const GRAPH = "https://graph.instagram.com/v21.0";
 
@@ -37,8 +43,15 @@ export function criarPublicador({
   fetch: fetchFn = globalThis.fetch,
   sleep = esperar,
   now = Date.now,
-  intervaloMs = 2000,
+  intervaloMs = STATUS_INTERVALO_INICIAL_MS,
+  intervaloMaxMs = STATUS_INTERVALO_MAX_MS,
+  esperaMinimaMs = STATUS_ESPERA_MINIMA_MS,
+  checagensMinimas = STATUS_CHECAGENS_MINIMAS,
 }) {
+  // undefined vindo das opções da rota cai no padrão
+  intervaloMs ??= STATUS_INTERVALO_INICIAL_MS;
+  intervaloMaxMs = Math.max(intervaloMaxMs ?? STATUS_INTERVALO_MAX_MS, intervaloMs);
+
   async function graph(metodo, caminho, params = {}) {
     const url = new URL(`${GRAPH}/${caminho}`);
     const init = { method: metodo, headers: { Authorization: `Bearer ${token}` } };
@@ -70,13 +83,24 @@ export function criarPublicador({
     return String(r.id);
   }
 
-  // Polling de status_code até FINISHED. Imagem costuma sair na hora; vídeo
-  // (Reels) pode levar minutos — o timeout é por chamada, pra caber no limite
-  // da função da Vercel.
-  async function aguardarStatus(containerId, { timeoutMs = 30_000 } = {}) {
+  // Polling de status_code até FINISHED. Imagem costuma sair em segundos;
+  // vídeo (Reels) pode levar minutos. timeoutMs é o que sobrou do orçamento
+  // da rota e pode chegar aqui curto, zero ou negativo (criação lenta). Mesmo
+  // assim: sempre checa de verdade, e só desiste depois de esperar pelo menos
+  // esperaMinimaMs E de ter feito checagensMinimas. A mensagem de timeout
+  // mostra o tempo REAL esperado aqui dentro.
+  //
+  // signal (opcional): quando outro container do mesmo lote já falhou, para
+  // de checar este na próxima volta, sem publicar nada.
+  async function aguardarStatus(containerId, { timeoutMs = 30_000, signal } = {}) {
     const inicio = now();
+    const limite = Math.max(Number(timeoutMs) || 0, esperaMinimaMs);
+    let intervalo = intervaloMs;
+    let checagens = 0;
     for (;;) {
+      if (signal?.aborted) throw cancelado(containerId);
       const r = await graph("GET", containerId, { fields: "status_code,status" });
+      checagens++;
       const codigo = r.status_code;
       if (codigo === "FINISHED") return;
       if (codigo === "ERROR") {
@@ -91,15 +115,22 @@ export function criarPublicador({
       if (codigo === "PUBLISHED") {
         throw new ErroHttp(409, `container ${containerId} já foi publicado. Nada foi feito.`);
       }
-      const restante = timeoutMs - (now() - inicio);
-      if (restante <= 0) {
+      const decorrido = Math.max(0, now() - inicio);
+      const restante = limite - decorrido;
+      if (restante <= 0 && checagens >= checagensMinimas) {
         throw new ErroHttp(
           504,
-          `container ${containerId} não ficou pronto em ${Math.round(timeoutMs / 1000)}s (último status: ${codigo || "desconhecido"}). Tente de novo em instantes.`
+          `container ${containerId} não ficou pronto em ${Math.round(decorrido / 1000)}s (último status: ${codigo || "desconhecido"}). Nada foi publicado.`
         );
       }
-      await sleep(Math.min(intervaloMs, restante));
+      // restante <= 0 com checagens faltando: espera o intervalo cheio.
+      await sleep(restante > 0 ? Math.min(intervalo, restante) : intervalo);
+      intervalo = Math.min(Math.round(intervalo * 1.5), intervaloMaxMs);
     }
+  }
+
+  function cancelado(containerId) {
+    return new ErroHttp(502, `espera do container ${containerId} cancelada: outro item do mesmo post falhou.`);
   }
 
   // GET /{user-id}/content_publishing_limit. Falha FECHADA: se não der pra
@@ -163,6 +194,36 @@ export function exigirJpeg(url, rotulo) {
   }
 }
 
+// ── Paralelismo ───────────────────────────────────────────────────────────
+
+// Roda as tarefas ao mesmo tempo e devolve os resultados NA ORDEM das
+// tarefas. Se alguma falhar: avisa as outras pelo signal (quem respeita,
+// para), espera todas terminarem (nada fica rodando depois da resposta) e
+// lança o PRIMEIRO erro, com o rótulo do item ("slide 3 de 9: ...").
+export async function emParalelo(tarefas, rotulo = (i) => `item ${i + 1}`) {
+  const controle = new AbortController();
+  let primeiro;
+  const resultados = await Promise.allSettled(
+    tarefas.map(async (tarefa, i) => {
+      try {
+        return await tarefa(controle.signal);
+      } catch (e) {
+        if (!primeiro) {
+          primeiro = { e, i };
+          controle.abort();
+        }
+        throw e;
+      }
+    })
+  );
+  if (primeiro) {
+    const { e, i } = primeiro;
+    if (e instanceof ErroHttp) throw new ErroHttp(e.status, `${rotulo(i)}: ${e.message}`);
+    throw e;
+  }
+  return resultados.map((r) => r.value);
+}
+
 // ── Registro de tipos ─────────────────────────────────────────────────────
 //
 // Cada tipo de mídia é uma entrada. A rota é genérica: pega o tipo do body,
@@ -200,16 +261,25 @@ export const TIPOS = {
     },
 
     async criarContainers(pub, { itens, legenda }, ctx) {
-      // 1. um container-filho por slide, NA ORDEM. Se algo falhar no meio, os
-      //    filhos já criados ficam órfãos e o Instagram descarta em 24h.
-      const filhos = [];
-      for (const url of itens) {
-        filhos.push(await pub.criarContainer({ image_url: url, is_carousel_item: true }));
-      }
-      // 2. espera cada filho (criados antes, então costumam já estar prontos)
-      for (const id of filhos) {
-        await pub.aguardarStatus(id, { timeoutMs: ctx.restanteMs() });
-      }
+      const total = itens.length;
+      const rotulo = (i) => `slide ${i + 1} de ${total}`;
+
+      // 1. um container-filho por slide, TODOS AO MESMO TEMPO. Cada POST
+      //    /media leva segundos (o Meta baixa a imagem antes de responder);
+      //    em sequência, 9 slides comiam o orçamento inteiro. emParalelo
+      //    devolve na ordem do array, não na ordem em que as respostas
+      //    chegam. Se algum falhar, os filhos criados ficam órfãos (não
+      //    aparecem no perfil; o Instagram descarta em 24h).
+      const filhos = await emParalelo(
+        itens.map((url) => () => pub.criarContainer({ image_url: url, is_carousel_item: true })),
+        rotulo
+      );
+      // 2. espera os filhos, também em paralelo. O primeiro que falhar
+      //    cancela a espera dos outros.
+      await emParalelo(
+        filhos.map((id) => (signal) => pub.aguardarStatus(id, { timeoutMs: ctx.restanteMs(), signal })),
+        rotulo
+      );
       // 3. container do carrossel, com os filhos na mesma ordem dos slides
       const params = { media_type: "CAROUSEL", children: filhos.join(",") };
       if (legenda) params.caption = legenda;
@@ -225,8 +295,9 @@ export const TIPOS = {
   //     opcional (booleano)
   //   criarContainers: criarContainer({ media_type: "REELS", video_url,
   //     caption, cover_url?, share_to_feed? }) e aguardarStatus com timeout
-  //     maior — vídeo leva minutos, não cabe num request de 60s; precisa
-  //     dividir em "cria o container" + "checa status e publica".
+  //     maior — vídeo pode levar vários minutos, e nem os 300s da função
+  //     (api/_lib/tempos.js) garantem; precisa dividir em "cria o container"
+  //     + "checa status e publica".
   REELS: {
     implementado: false,
     descricao: "Reels (video_url, media_type=REELS, cover_url/share_to_feed opcionais)",

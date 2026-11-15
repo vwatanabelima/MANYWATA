@@ -1,6 +1,6 @@
 {
   "functions": {
-    "api/midia/*.js": { "maxDuration": 60 },
-    "api/carrossel/*.js": { "maxDuration": 60 }
+    "api/midia/*.js": { "maxDuration": 300 },
+    "api/carrossel/*.js": { "maxDuration": 300 }
   }
 }
