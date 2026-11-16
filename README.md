@@ -37,8 +37,11 @@ Project → Settings → Environment Variables. Veja `.env.example`.
 | `DM_AUTO_CONFIANCA_MIN` | opcional, padrão `0.7`: abaixo disso a resposta do LLM vai pra humano |
 | `OPENROUTER_API_KEY` | chave do OpenRouter (mesmo nome do painel). Só é usada com `DM_AUTO_RESPOSTA=1` |
 | `OPENROUTER_MODELO_AGENTE` | opcional, padrão `deepseek/deepseek-v4.1-flash-1017` (o mesmo do agente do WhatsApp no painel) |
+| `DM_FRASE_HUMANO` | opcional: frase que vai pro cliente quando a DM passa pra humano. Padrão: "Vou chamar o Vini pra te ajudar com isso, ele te responde aqui rapidinho 😊". Se não passar nas travas (telefone, link, preço...), usa a padrão |
+| `TELEGRAM_BOT_TOKEN` | opcional, **mesmo nome e mesmo bot do painel**: liga o aviso no Telegram quando a DM passa pra humano (só com `TELEGRAM_CHAT_ID` junto) |
+| `TELEGRAM_CHAT_ID` | opcional, mesmo nome e valor do painel: o chat do Vinicius que recebe o aviso |
 
-🔴 Os tokens `IG_ACCESS_TOKEN*` são tipo **Encrypted**, nunca **Sensitive**: o cron `refresh-token.mjs` precisa ler o valor de volta pra renovar. O `PUBLICAR_SECRET` pode ser Sensitive. As de DM (`DM_SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`) também podem ser Sensitive: ninguém precisa ler de volta.
+🔴 Os tokens `IG_ACCESS_TOKEN*` são tipo **Encrypted**, nunca **Sensitive**: o cron `refresh-token.mjs` precisa ler o valor de volta pra renovar. O `PUBLICAR_SECRET` pode ser Sensitive. As de DM (`DM_SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`) também podem ser Sensitive: ninguém precisa ler de volta.
 
 Depois de setar/alterar env var → **`vercel --prod` de novo** (a Vercel não relê env em runtime sem redeploy).
 
@@ -78,7 +81,7 @@ Cobre o cadastro de contas e o casamento de regras. Os testes de invariante exis
 
 `tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro. Stories: params exatos do container (`image_url` + `media_type: "STORIES"`, sem `caption`), 1 item só, legenda recusada, não-JPEG, 503/401/`confirmar` sem fetch, cota cheia sem container, story sem permalink → 200 sem aviso, vídeo e `REELS` → 501, alias do carrossel recusando `STORIES`, o subcomando `story` do CLI (upload de 1 arquivo, limpeza, 504 mantém o arquivo, `--dry-run`, aviso de dimensões) e a leitura de largura x altura do JPEG.
 
-`tests/dm.test.js` cobre as [DMs](#dms) com Meta, Supabase e OpenRouter sempre falsos (o Supabase é um PostgREST de mentira em memória, com filtros, upsert e PATCH condicional, pra trava e idempotência se comportarem como no banco): gravação (texto, anexo, eventos ignorados, outra conta), idempotência pelo `mid`, sem envs do banco → `warn` e 200, erro do banco → 200 sem vazar chave, **comentário→DM com as mesmas chamadas `fetch` de antes** (só comentário, misto, banco/LLM fora do ar), chave desligada (zero LLM, zero envio), envio com `recipient.id = IGSID` e log, prompt (modelo, params, manual, contexto), pré-checagem, cada trava (modelo pede humano, confiança, JSON inválido, telefone, Black Friday antes/depois de 24/11, 1000 bytes, preço, prazo, link), eco manual / eco nosso (inclusive chegando antes de gravarmos o `mid`) / eco do comentário→DM, janela de 24h, limite por janela, trava atômica com entregas simultâneas, mensagem nova durante o LLM e durante o envio, falha no envio sanitizada, e os arquivos (manual, `vercel.json`, migração).
+`tests/dm.test.js` cobre as [DMs](#dms) com Meta, Supabase e OpenRouter sempre falsos (o Supabase é um PostgREST de mentira em memória, com filtros, upsert e PATCH condicional, pra trava e idempotência se comportarem como no banco): gravação (texto, anexo, eventos ignorados, outra conta), idempotência pelo `mid`, sem envs do banco → `warn` e 200, erro do banco → 200 sem vazar chave, **comentário→DM com as mesmas chamadas `fetch` de antes** (só comentário, misto, banco/LLM fora do ar), chave desligada (zero LLM, zero envio), envio com `recipient.id = IGSID` e log, prompt (modelo, params, manual, contexto do Instagram: sem foto/aprovação no direct, pedido pelo site, o que ignorar do manual, soma de planos, "arte" em vez de "prévia"), pré-checagem (com e sem pedido já feito), cada trava (modelo pede humano, confiança, JSON inválido, telefone × CEP/CNPJ, Black Friday antes/depois de 24/11, 1000 bytes, preço e somas de planos até 20 cartas, prazo 48h/somado × frete/arrependimento, link do site × wa.me/outros domínios, "prévia"), passar pra humano (frase uma vez só, PATCH atômico, janela fechando durante o LLM, `DM_FRASE_HUMANO` recusada, eco da frase, banco falhando), aviso no Telegram (desligado sem env, formato do painel, erro sanitizado sem o token do bot), falha do OpenRouter (5xx, 429, rede, timeout) e da Meta → humano, eco manual / eco nosso (inclusive chegando antes de gravarmos o `mid`) / eco do comentário→DM, janela de 24h, limite por janela, trava atômica com entregas simultâneas, mensagem nova durante o LLM e durante o envio, falha no envio sanitizada, os arquivos (sha256 do manual, `vercel.json`, migração com view e expurgo) e o `scripts/checar-manual.mjs` com `gh`/fetch falsos.
 
 ## Insights orgânicos
 
@@ -343,7 +346,7 @@ Tudo exige a mesma permissão do carrossel (`instagram_business_content_publish`
 
 ## DMs
 
-Grava as DMs que chegam no **@eternizacards** e, com a chave ligada, responde sozinho na hora, com as regras do manual do atendimento. **Desligado por padrão**: sem `DM_AUTO_RESPOSTA=1` só grava. Não tem tela de aprovação nem rascunho: ou responde na hora, ou passa pra humano (marca a conversa e para de responder ali).
+Grava as DMs que chegam no **@eternizacards** e, com a chave ligada, responde sozinho na hora, com as regras do manual do atendimento. **Desligado por padrão**: sem `DM_AUTO_RESPOSTA=1` só grava. Não tem tela de aprovação nem rascunho: ou responde na hora, ou passa pra humano (marca a conversa, manda uma frase curta de espera pro cliente, avisa o Vinicius e para de responder ali; ver [Passar pra humano](#passar-pra-humano-frase-e-aviso)).
 
 ### Como funciona
 
@@ -353,13 +356,23 @@ Grava as DMs que chegam no **@eternizacards** e, com a chave ligada, responde so
 4. Com `DM_AUTO_RESPOSTA=1`, pra cada conversa com mensagem nova:
    - pega a **trava** da conversa (PATCH condicional no PostgREST: só passa se estiver livre ou vencida, sem humano e sem pausa). Quem não pega a trava não responde; quem pegou cobre também o que chegou enquanto ela estava ocupada;
    - só segue se a última mensagem ainda é do cliente, dentro da **janela de 24h** e abaixo do **limite por janela**;
-   - **pré-checagem** sem LLM (reclamação, cancelamento, pagamento, entrega, mais de 20 cartas): passa pra humano direto;
-   - chama o LLM (OpenRouter, mesmo modelo e forma do agente do WhatsApp do painel): system prompt = manual inteiro + contexto (data/hora BRT, que é direct do Instagram e não WhatsApp, Black Friday ativa ou não, as regras abaixo); histórico da conversa como user/assistant; o turno do cliente por último. O modelo devolve JSON `{acao, texto, motivo, confianca}`;
+   - **pré-checagem** sem LLM: passa pra humano direto em reclamação explícita, cancelamento/reembolso, problema de pagamento, mais de 20 cartas, e em palavras de entrega/pagamento/devolução (correios, entregue, endereço, não recebi, comprovante, cobrança, devolução...) **só quando há contexto de pedido já feito** ("meu pedido", "minha encomenda", "comprei", "já paguei", "fiz o pedido", `#1234`, "pedido 1234"). Sem esse contexto ("vocês entregam pelos correios?", "aceita devolução?") é pré-venda e o modelo responde;
+   - chama o LLM (OpenRouter, mesmo modelo e forma do agente do WhatsApp do painel): system prompt = manual inteiro + contexto (data/hora BRT, que é direct do Instagram e não WhatsApp, o que do manual ignorar, Black Friday ativa ou não, as regras abaixo); histórico da conversa como user/assistant; o turno do cliente por último. O modelo devolve JSON `{acao, texto, motivo, confianca}`;
    - passa o texto pelas **travas** (abaixo); reconfere se o Vinicius não respondeu e se não chegou mensagem nova no meio (se chegou, refaz com o turno inteiro);
    - envia: `POST /me/messages` com `recipient.id = IGSID` e o token da eterniza. Grava a saída com o `mid` devolvido pela Meta logo depois e registra em `ig_dm_log`.
+   - erro do LLM (rede, timeout, 5xx, 429, chave recusada) ou falha do envio pela Meta → **passa pra humano** (frase + marcação + aviso), em vez de deixar o cliente sem resposta.
 5. **Eco** (`is_echo`, o que sai da conta): se não é envio nosso, é o Vinicius respondendo pelo app → a conversa fica `pausada_manual` (motivo `vinicius_respondeu`) e a automação para ali. Eco do nosso envio é ignorado: pelo `mid` gravado, ou, se o eco chegar antes de gravarmos o `mid`, pelo texto (gravado na conversa **antes** do POST) dentro de 2 minutos. O eco do DM do comentário→DM vira saída automática (`origem = comentario`), não pausa.
 
-Código: `api/_lib/dm.js` (orquestração), `dm-regras.js` (pré-checagem, travas, contexto do prompt; puro), `dm-llm.js` (OpenRouter + leitura do manual), `dm-banco.js` (PostgREST com `fetch`). O manual é `docs/agente-whatsapp-manual.md`, cópia de `eternizacards-painel/docs/agente-whatsapp-manual.md @ dc6e271`, lido em runtime (`vercel.json` inclui o arquivo na função do webhook). **Mudou o manual no painel, copie de novo pra cá** e confira as travas de `dm-regras.js` (preços, prazos, datas da Black Friday).
+Código: `api/_lib/dm.js` (orquestração), `dm-regras.js` (pré-checagem, travas, contexto do prompt, frase de humano; puro), `dm-llm.js` (OpenRouter + leitura do manual + cabeçalho/sha256 da cópia), `dm-banco.js` (PostgREST com `fetch`), `dm-aviso.js` (aviso ao Vinicius por canal). O manual é `docs/agente-whatsapp-manual.md`, cópia de `eternizacards-painel/docs/agente-whatsapp-manual.md` (commit e sha256 no cabeçalho), lido em runtime (`vercel.json` inclui o arquivo na função do webhook). Ver [Manual: cópia e divergência](#manual-cópia-e-divergência).
+
+### Manual: cópia e divergência
+
+O painel é repo **privado**: buscar o manual no build da Vercel exigiria um token novo do GitHub guardado na Vercel, só pra isso. Escolha: **manter a cópia no repo**, com duas checagens:
+
+1. **Edição local:** o cabeçalho da cópia tem o commit de origem e o **sha256 do conteúdo** (tudo depois do comentário, byte a byte igual ao arquivo do painel). O `npm test` recalcula o sha256 e falha se não bater. Quem editar a cópia à mão quebra o teste.
+2. **Mudança no painel:** `npm run checar-manual` busca `docs/agente-whatsapp-manual.md` da main do painel com o **`gh` já logado do operador** (`gh api repos/vwatanabelima/eternizacards-painel/contents/...?ref=main`, sem shell; se não tiver `gh` e existir `GITHUB_TOKEN` no ambiente, usa a API com ele) e compara. Saída `0` = em dia; `1` = diverge (mostra o commit mais recente do arquivo no painel); `2` = erro (sem `gh`, sem acesso...). `npm run checar-manual -- --atualizar` regrava a cópia e o cabeçalho (commit + sha256). Depois disso: conferir as travas de `dm-regras.js` (preços, prazos, Black Friday) e `npm test`.
+
+O script fala com o GitHub, então não roda no teste nem no build: é do terminal do operador, antes de mexer nas DMs ou quando o painel mudar o manual.
 
 ### Checklist da Meta (Vinicius)
 
@@ -376,28 +389,49 @@ Código: `api/_lib/dm.js` (orquestração), `dm-regras.js` (pré-checagem, trava
 
 ### Regras e travas
 
-Tudo que dá pra checar sem LLM é checado no código (`dm-regras.js`), além de estar no prompt. Quando uma trava bate, **nada é enviado**: a conversa vira `humano = true` (com `humano_motivo` e `humano_em`) e daí em diante a automação não responde mais nela.
+Tudo que dá pra checar sem LLM é checado no código (`dm-regras.js`), além de estar no prompt. Quando uma trava bate, **o texto do LLM não é enviado**: a conversa passa pra humano (ver [abaixo](#passar-pra-humano-frase-e-aviso)) e daí em diante a automação não responde mais nela.
 
 | Regra | No prompt | Trava no código |
 |---|---|---|
 | Chave desligada por padrão | — | só `DM_AUTO_RESPOSTA=1` liga |
-| Preços só do manual (R$ 39,90, R$ 99,90, frete R$ 8 a R$ 20) | ✅ | qualquer outro `R$` → humano (`preco_fora_do_manual`) |
-| Prazo: 3 dias úteis de arte depois que chegam fotos e nome + 4 dias úteis de produção depois da aprovação | ✅ | "N dias úteis" com N ≠ 3/4, ou "horas úteis" → humano (`prazo_fora_do_manual`) |
+| Preços: os do manual (R$ 39,90, R$ 99,90, frete R$ 8 a R$ 20) **e somas de planos até 20 cartas** (a × R$ 39,90 + b × R$ 99,90 com a + 3b ≤ 20: R$ 79,80, R$ 139,80, R$ 199,80...) | ✅ ("pode somar os planos até 20 cartas; acima, humano") | qualquer outro `R$` (desconto, inventado, combinação de 21+ cartas) → humano (`preco_fora_do_manual`) |
+| Prazo: 3 dias úteis de arte depois que chegam fotos e nome + 4 dias úteis de produção depois da aprovação; frete de 3 a 7 dias | ✅ | "N dias úteis" com N ≠ 3/4, "horas úteis", 48h/48 h/48 horas, total somado ("pronto em 7 dias", "em até 7 dias", "chega em 10 dias", "uma semana", "no total são N dias") → humano (`prazo_fora_do_manual`). Passam "3 a 7 dias" (frete) e "7 dias corridos" (arrependimento) |
 | Black Friday só de 24/11/2026 00:00 a 30/11/2026 23:59 BRT | ✅ (o contexto diz se está ativa) | fora disso, texto com "black" → humano (`black_friday`) |
-| Sem prévia antes do pagamento; chamar de "arte" | ✅ | — |
-| Nenhum telefone no texto | ✅ | 8+ dígitos seguidos (com espaço/ponto/hífen/parênteses) → humano (`telefone`) |
-| Só o link do pedido (`eternizacards.com.br`) | ✅ | outro link → humano (`link_fora_do_manual`) |
+| Antes do pagamento não existe arte nem amostra; falar sempre em "arte", nunca "prévia" | ✅ | texto com a palavra "prévia(s)" → humano (`vocabulario_previa`) |
+| Nenhum telefone no texto | ✅ | 8+ dígitos seguidos (com espaço/ponto/hífen/parênteses/+55) → humano (`telefone`). **Não** conta CNPJ (`12.345.678/0001-90`) nem CEP (`01310-100`, ou 8 dígitos depois de "CEP") |
+| Links só do site | ✅ (manda o link do pedido) | só `https://eternizacards.com.br` / `www.`, **qualquer caminho, query e UTM** (`/trocas`, `/pedido?plano=trio`). Outro domínio (inclusive sem `https://`, tipo `bit.ly/x`), `wa.me`, `api.whatsapp.com`, `http://`, porta, `usuario@` → humano (`link_fora_do_manual`) |
 | Nada além do manual | ✅ | o modelo devolve `acao: "humano"` → humano (`modelo:<MOTIVO>`) |
 | Até 1000 bytes UTF-8 (limite da DM) | ✅ (pede até 600 caracteres) | acima → humano (`tamanho`), **não trunca** |
 | Confiança mínima | ✅ | `confianca` < `DM_AUTO_CONFIANCA_MIN` (0.7) → humano (`confianca_baixa`) |
 | Resposta do LLM inválida / JSON quebrado / texto vazio | — | humano (`llm_invalido` / `texto_vazio`) |
-| Reclamação, cancelamento, pagamento, entrega, > 20 cartas | ✅ | pré-checagem por palavra-chave, **antes** do LLM (`reclamacao`, `cancelamento`, `pagamento`, `entrega`, `quantidade`) |
+| Reclamação, cancelamento, pagamento, entrega, > 20 cartas | ✅ | pré-checagem **antes** do LLM (`reclamacao`, `cancelamento`, `pagamento`, `entrega`, `quantidade`); entrega/pagamento/devolução só com pedido já feito (ver [Como funciona](#como-funciona)) |
 | Janela de 24h | — | última mensagem do cliente com 24h ou mais → não responde (log `bloqueio`, `fora_da_janela`) |
 | Máximo por conversa | — | `DM_AUTO_MAX_POR_JANELA` (5) respostas a cada 24h; atingiu → humano (`limite_respostas`) |
 | Sem resposta duplicada | — | idempotência pelo `mid` + trava atômica por conversa + só responde se a última mensagem ainda é do cliente |
 | O Vinicius respondeu pelo app | — | eco manual → `pausada_manual`, automação para |
+| Falha do OpenRouter (rede, timeout, 5xx, 429, chave recusada) | — | humano (`erro_llm`) |
+| Falha do envio pela Meta | — | log `erro_envio` (sanitizado) + humano (`envio_falhou`) |
 
-Erro do OpenRouter (rede, 5xx) **não** passa pra humano: vira log `bloqueio` (`erro_llm`) e a próxima mensagem do cliente tenta de novo. Falha no envio pela Meta vira log `erro_envio` (sanitizado, sem token). Elogio é respondido normal (o manual manda só avisar o Vini).
+**Mudou:** antes, erro do OpenRouter virava só log `bloqueio` e o cliente ficava sem resposta até mandar outra mensagem. Agora passa pra humano como qualquer trava (o cliente recebe a frase de espera e o Vinicius é avisado). Sem `OPENROUTER_API_KEY` continua `bloqueio` (`sem_chave_llm`): é configuração, não falha. Elogio é respondido normal (o manual manda só avisar o Vini).
+
+Por que a trava de "prévia" é segura: o prompt manda recusar amostra falando só da arte ("a arte é feita depois do pagamento") e não usar "prévia". Nenhuma resposta certa tem essa palavra, então a trava só pega quando o modelo desobedece; `\bprévias?\b` não pega "previamente" nem "aviso prévio".
+
+### Passar pra humano: frase e aviso
+
+Quando uma conversa passa pra humano (trava, pré-checagem, modelo pediu, limite, falha do LLM ou da Meta):
+
+1. **Marca** a conversa: `humano = true`, `humano_motivo`, `humano_em`. A automação não responde mais ali. Log `humano` em `ig_dm_log`.
+2. **Frase pro cliente**, curta e humana: `DM_FRASE_HUMANO` ou a padrão *"Vou chamar o Vini pra te ajudar com isso, ele te responde aqui rapidinho 😊"*. Regras:
+   - **no máximo uma vez por conversa marcada**: PATCH condicional (`humano = true`, `pausada_manual = false`, `humano_frase_enviada_em is null`); só quem pega a linha envia, mesmo com duas execuções ao mesmo tempo;
+   - **só com a janela de 24h aberta** (conferida de novo na hora de enviar: o LLM pode ter levado o relógio além das 24h);
+   - passa pelas mesmas travas do texto (sem telefone, sem link de fora...); `DM_FRASE_HUMANO` que não passar é ignorada (usa a padrão e loga `warn`);
+   - gravada como saída (`direcao = saida_auto`, `origem = sistema`) com log `frase_humano`; o texto é marcado na conversa **antes** do POST, então o eco dela não pausa a conversa;
+   - **tentativa única**: se a Meta recusar (inclusive quando o motivo da passagem foi a própria falha de envio), fica o log `erro_envio` (`motivo = frase_humano`) e não tenta de novo.
+3. **Aviso ao Vinicius**, em paralelo com a frase (`api/_lib/dm-aviso.js`, `avisarHumano({igsid, motivo, detalhe, ultimoTexto})`):
+   - **sempre registrado no banco**: a view **`ig_dm_pendentes_humano`** lista o que passou pra humano e ainda não foi atendido pelo app (motivo, hora, se a frase saiu, último texto do cliente, detalhe). Quando o Vinicius responde pelo app, o eco marca `pausada_manual` e a conversa sai da view;
+   - **Telegram (opcional)**, no mesmo padrão do painel (`lib/agente/zap/saida.ts`, `avisar()`): mesmas envs `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` (pode reaproveitar o bot e o chat do painel), `sendMessage` com `disable_web_page_preview` e texto até 4000. Só liga com as **duas** envs; sem elas, só `console.log` e banco. O texto tem motivo, detalhe curto, IGSID e um trecho do que o cliente escreveu; nunca token. Erro do Telegram vira `console.error` sanitizado (sem o token do bot, que vai na URL) e não quebra nada.
+
+Outras opções de aviso (não implementadas): **e-mail** pra `eternizacards@gmail.com` via Resend (`RESEND_API_KEY`; o painel hoje não tem e-mail configurado, nem Resend nem SMTP): seria mais um item em `CANAIS` de `dm-aviso.js`. Ou o **painel lendo a view** `ig_dm_pendentes_humano` com a service role e mostrando a fila numa tela.
 
 ### Onde fica guardado
 
@@ -405,19 +439,25 @@ Recomendação: **Supabase do eternizacards (`ksjvuvpnctdzapazoypy`)**, schema `
 
 | Tabela | O que guarda |
 |---|---|
-| `ig_dm_conversas` | uma linha por cliente (`igsid` único): `ultima_entrada_em`, `humano` / `humano_motivo` / `humano_em`, `pausada_manual` / `pausada_motivo` / `pausada_em`, trava (`respondendo_ate`, `trava_id`), contador (`auto_respostas_janela`, `janela_inicio_em`), `ultima_auto_texto` / `ultima_auto_em` (pro eco) |
-| `ig_dm_mensagens` | cada mensagem (`mid` único): `igsid`, `texto`, `tipo`, `direcao` (`entrada` / `saida_auto` / `eco_manual`), `origem` (`cliente` / `llm` / `comentario` / `vinicius`), `enviada_em`, `criado_em` |
-| `ig_dm_log` | `tipo` (`resposta` / `humano` / `erro_envio` / `bloqueio`), `igsid`, `mid_entrada`, `mid_saida`, `texto`, `modelo`, `custo_usd`, `confianca`, `motivo`, `detalhe`, `criado_em` |
+| `ig_dm_conversas` | uma linha por cliente (`igsid` único): `ultima_entrada_em`, `humano` / `humano_motivo` / `humano_em` / `humano_frase_enviada_em`, `pausada_manual` / `pausada_motivo` / `pausada_em`, trava (`respondendo_ate`, `trava_id`), contador (`auto_respostas_janela`, `janela_inicio_em`), `ultima_auto_texto` / `ultima_auto_em` (pro eco) |
+| `ig_dm_mensagens` | cada mensagem (`mid` único): `igsid`, `texto`, `tipo`, `direcao` (`entrada` / `saida_auto` / `eco_manual`), `origem` (`cliente` / `llm` / `comentario` / `vinicius` / `sistema`), `enviada_em`, `criado_em` |
+| `ig_dm_log` | `tipo` (`resposta` / `humano` / `frase_humano` / `erro_envio` / `bloqueio`), `igsid`, `mid_entrada`, `mid_saida`, `texto`, `modelo`, `custo_usd`, `confianca`, `motivo`, `detalhe`, `criado_em` |
+| `ig_dm_pendentes_humano` (view) | fila do Vinicius: `humano = true` e ainda não atendida pelo app. `igsid`, `motivo`, `humano_em`, `humano_frase_enviada_em`, `ultima_entrada_em`, `ultimo_texto_cliente`, `detalhe`. `security_invoker = true`, mesmos revokes; só a service role lê |
 
 Consultas úteis (SQL Editor do Supabase):
 
 ```sql
--- conversas que passaram pra humano ou foram pausadas
+-- o que está esperando o Vinicius
+select * from ig_dm_pendentes_humano;
+
+-- conversas que passaram pra humano ou foram pausadas (inclusive as já atendidas)
 select igsid, humano_motivo, humano_em, pausada_motivo, pausada_em
 from ig_dm_conversas where humano or pausada_manual order by coalesce(humano_em, pausada_em) desc;
 
--- devolver uma conversa pra automação
+-- devolver uma conversa pra automação (zera a frase também: na próxima
+-- passagem pra humano ela sai de novo)
 update ig_dm_conversas set humano = false, humano_motivo = null, humano_em = null,
+  humano_frase_enviada_em = null,
   pausada_manual = false, pausada_motivo = null, pausada_em = null
 where igsid = '<igsid>';
 
@@ -427,15 +467,28 @@ where criado_em >= date_trunc('day', now() at time zone 'America/Sao_Paulo') at 
 group by 1, 2 order by 3 desc;
 ```
 
+#### Retenção
+
+A migração cria `public.ig_dm_expurgar(dias int default 180)`: apaga mensagens e logs com mais de N dias e conversas sem mensagem nem movimento nesse período; devolve quantas linhas saíram de cada tabela. `security definer` com `search_path` vazio e nomes qualificados; `revoke` de `public`/`anon`/`authenticated`, `execute` só pra `service_role`.
+
+**180 dias** (e não 90): cobre o arrependimento (7 dias), entrega atrasada (art. 35, sem prazo curto) e contestação de cartão (chargeback, até ~180 dias), sem guardar conversa de cliente pra sempre (LGPD: minimização). Pra rodar à mão: `select * from public.ig_dm_expurgar();` (ou `(90)`).
+
+Agendamento sugerido com **pg_cron** (está só **comentado** na migração, não ativado; precisa da extensão ligada no projeto):
+
+```sql
+select cron.schedule('ig_dm_expurgar', '30 6 * * 0', $cron$select public.ig_dm_expurgar(180)$cron$);  -- domingo 06:30 UTC
+-- desligar: select cron.unschedule('ig_dm_expurgar');
+```
+
 ### Envs
 
-Nomes (valores só na Vercel, nunca no repo): `DM_SUPABASE_URL`, `DM_SUPABASE_SERVICE_ROLE_KEY`, `DM_AUTO_RESPOSTA`, `DM_AUTO_MAX_POR_JANELA` (opcional), `DM_AUTO_CONFIANCA_MIN` (opcional), `OPENROUTER_API_KEY`, `OPENROUTER_MODELO_AGENTE` (opcional). Detalhes em [Env vars](#env-vars-na-vercel).
+Nomes (valores só na Vercel, nunca no repo): `DM_SUPABASE_URL`, `DM_SUPABASE_SERVICE_ROLE_KEY`, `DM_AUTO_RESPOSTA`, `DM_AUTO_MAX_POR_JANELA` (opcional), `DM_AUTO_CONFIANCA_MIN` (opcional), `OPENROUTER_API_KEY`, `OPENROUTER_MODELO_AGENTE` (opcional), `DM_FRASE_HUMANO` (opcional), `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` (opcionais, os mesmos do painel). Detalhes em [Env vars](#env-vars-na-vercel). Só no terminal do operador, pro `checar-manual`: `gh` logado (ou `GITHUB_TOKEN`).
 
 Por que `DM_SUPABASE_*` e não `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`: estas duas, neste repo, são do terminal do operador (CLI de mídia) e a regra é **não** irem pra Vercel. Nomes próprios deixam claro que a da Vercel é só do webhook de DM.
 
 ### Custo estimado por resposta
 
-- **Entrada:** o system prompt tem ~37.200 caracteres (manual ~34.700 + contexto ~2.400) ≈ **9.300 tokens** (~4 caracteres/token). Mais o histórico da conversa (até 30 mensagens; numa conversa normal, algumas centenas de tokens): **~9.500 a 10.500 tokens por resposta**.
+- **Entrada:** o system prompt tem ~38.800 caracteres (manual com cabeçalho ~34.900 + contexto ~3.900) ≈ **9.700 tokens** (~4 caracteres/token). Mais o histórico da conversa (até 30 mensagens; numa conversa normal, algumas centenas de tokens): **~9.500 a 10.500 tokens por resposta**.
 - **Saída:** o JSON com a resposta, **~150 a 300 tokens** (teto `max_tokens: 700`).
 - **Conta:** `custo ≈ 10.000 × preço_entrada/1M + 300 × preço_saída/1M`. Com os preços do `deepseek/deepseek-v4.1-flash-1017` consultados em 16/11/2026 na API pública de modelos do OpenRouter — US$ 0,036/M (entrada), US$ 0,50/M (saída) e US$ 0,01/M (entrada em cache): 10.000 × 0,036/1M = US$ 0,00036 + 300 × 0,50/1M = US$ 0,00015 ≈ **US$ 0,0005 por resposta** (≈ R$ 0,003 com dólar a ~R$ 5,50; ~1.000 respostas ≈ US$ 0,51). **Confira o preço do modelo no OpenRouter no dia** (openrouter.ai, página do modelo); ele muda, e cache de prompt pode baratear a entrada.
 - O custo **real** de cada chamada vem na resposta da API (`usage.cost`, em USD) e vai pro `ig_dm_log.custo_usd`, inclusive quando passa pra humano depois do LLM. Pré-checagem e janela fechada custam zero (não chamam o LLM). Se o cliente manda outra mensagem enquanto o LLM pensa, a resposta é refeita (2 chamadas).
@@ -443,12 +496,13 @@ Por que `DM_SUPABASE_*` e não `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`: est
 
 ### Ativar
 
+0. `npm run checar-manual` (cópia do manual em dia com a main do painel) e `npm test`.
 1. Aplicar a migração no Supabase do eternizacards (SQL Editor ou `supabase db push`).
-2. Criar na Vercel (production): `DM_SUPABASE_URL`, `DM_SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY` (e, se quiser, `OPENROUTER_MODELO_AGENTE`, `DM_AUTO_MAX_POR_JANELA`, `DM_AUTO_CONFIANCA_MIN`). **Não** criar `DM_AUTO_RESPOSTA` ainda.
+2. Criar na Vercel (production): `DM_SUPABASE_URL`, `DM_SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY` (e, se quiser, `OPENROUTER_MODELO_AGENTE`, `DM_AUTO_MAX_POR_JANELA`, `DM_AUTO_CONFIANCA_MIN`, `DM_FRASE_HUMANO`). Pro aviso no Telegram: `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` com os mesmos valores do painel. **Não** criar `DM_AUTO_RESPOSTA` ainda.
 3. Conferir o [checklist da Meta](#checklist-da-meta-vinicius).
 4. Mergear (a Vercel redeploya; se só mudou env, `vercel --prod`).
 5. Testar com uma DM real, **com a chave ainda desligada**: mandar uma DM pra @eternizacards de outra conta e ver a linha em `ig_dm_mensagens` (e o log `dm ... gravada` na Vercel). Testar também um comentário com "quero" pra ver que o comentário→DM segue igual.
-6. Ligar: `DM_AUTO_RESPOSTA=1` na Vercel + redeploy. Mandar outra DM de teste e conferir a resposta e a linha `resposta` em `ig_dm_log`.
+6. Ligar: `DM_AUTO_RESPOSTA=1` na Vercel + redeploy. Mandar outra DM de teste e conferir a resposta e a linha `resposta` em `ig_dm_log`. Mandar uma DM que passa pra humano ("quero cancelar meu pedido") e conferir: a frase chegou no direct, a conversa aparece em `ig_dm_pendentes_humano` e (com as envs) o aviso chegou no Telegram. Responder pelo app e ver a conversa sair da view.
 
 ### Desligar
 
@@ -457,10 +511,10 @@ Por que `DM_SUPABASE_*` e não `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`: est
 ### O que NÃO faz
 
 - Não tem tela, rascunho nem aprovação: ou responde na hora, ou passa pra humano.
-- Não avisa o Vinicius (Telegram etc.) quando passa pra humano: fica marcado no banco (`ig_dm_conversas.humano`, `ig_dm_log`). Ele vê no direct do app como sempre.
-- Não manda mensagem pro cliente ao passar pra humano (o cliente fica sem resposta até o Vinicius responder).
-- Não consulta pedido (não tem `consultar_pedido` nem `link_pedido` do painel): qualquer pergunta sobre pedido já feito vai pra humano. O link mandado é sempre o mesmo (`eternizacards.com.br` com UTM `instagram / dm / direct`).
-- Não ouve áudio nem vê foto: o modelo só sabe que veio um anexo.
+- Não avisa por e-mail (nem o painel tem e-mail configurado). Aviso só pelo Telegram, e só com `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; sem eles, a fila fica só no banco (`ig_dm_pendentes_humano`).
+- Não manda mais de uma frase de espera por passagem pra humano, nem frase fora da janela de 24h. Não insiste se a frase falhar.
+- Não consulta pedido (não tem `consultar_pedido` nem `link_pedido` do painel): qualquer pergunta sobre pedido já feito vai pra humano. O link que o prompt manda usar é sempre o mesmo (`eternizacards.com.br` com UTM `instagram / dm / direct`); a trava aceita outras páginas do site.
+- Não recebe foto nem aprova arte pelo direct: o pedido é pelo site e as fotos vão pelo link do pós-compra. Não ouve áudio nem vê foto: o modelo só sabe que veio um anexo.
 - Não manda nada fora da janela de 24h, nem lembrete, nem mensagem que o cliente não puxou.
 - Não volta sozinho de "humano" ou "pausada": é um `update` no banco (acima).
 - Não trata DM de outras contas (só a eterniza).

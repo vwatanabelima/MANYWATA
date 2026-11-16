@@ -1,9 +1,11 @@
 <!--
   Cópia de eternizacards-painel/docs/agente-whatsapp-manual.md @ dc6e271 (main).
+  sha256: f92f3c14f9e18ce8c3d0259e6f264821dcaf4c61a43d4700440a3ce2a61b405a (do conteúdo abaixo deste comentário, igual ao arquivo do painel)
   É a FONTE das regras da resposta automática de DM do Instagram: vai inteiro
   no system prompt (api/_lib/dm-llm.js lê este arquivo em runtime).
-  Manter em sincronia com o painel: mudou lá, copie de novo pra cá (e confira
-  as travas de api/_lib/dm-regras.js: preços, prazos, Black Friday).
+  NÃO edite o conteúdo aqui (o teste recalcula o sha256 e falha). Mudou no
+  painel: npm run checar-manual -- --atualizar, e confira as travas de
+  api/_lib/dm-regras.js (preços, prazos, Black Friday).
   O que é diferente no Instagram (sem ferramentas, link fixo, sem negrito) está
   no bloco de contexto de api/_lib/dm-regras.js, não aqui.
 -->

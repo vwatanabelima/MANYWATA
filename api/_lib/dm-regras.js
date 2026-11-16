@@ -23,14 +23,35 @@ export const ECO_PROPRIO_MS = 2 * 60_000;
 export const BLACK_FRIDAY_INICIO = Date.parse("2026-11-24T00:00:00.000-03:00");
 export const BLACK_FRIDAY_FIM = Date.parse("2026-11-30T23:59:59.999-03:00");
 
-// Único link que a resposta automática pode mandar (o manual manda um link
-// do pedido; aqui não existe a ferramenta link_pedido do painel).
+// Link do pedido que o prompt manda usar (o manual manda um link do pedido;
+// aqui não existe a ferramenta link_pedido do painel). A trava aceita
+// qualquer caminho https de eternizacards.com.br (ver linkPermitido).
 export const LINK_PEDIDO = "https://eternizacards.com.br/?utm_source=instagram&utm_medium=dm&utm_campaign=direct";
+const HOSTS_PERMITIDOS = new Set(["eternizacards.com.br", "www.eternizacards.com.br"]);
 
-// Preços que existem no manual (seção 2): Única 39,90, Trio 99,90, Black
-// Friday 99,90 e o frete da Única "entre R$ 8 e R$ 20". Qualquer outro R$
-// no texto (soma, desconto, preço inventado) passa pra humano.
-const PRECOS_DO_MANUAL = new Set(["39.90", "99.90", "8.00", "20.00"]);
+// Frase pro cliente quando a conversa passa pra humano (DM_FRASE_HUMANO troca).
+export const FRASE_HUMANO_PADRAO = "Vou chamar o Vini pra te ajudar com isso, ele te responde aqui rapidinho 😊";
+
+// Planos que dá pra somar (manual, seção 3b, 7b: "até 20 cartas, é só juntar
+// os planos no site"). Valores em centavos.
+const UNICA = { cartas: 1, centavos: 3990 };
+const TRIO = { cartas: 3, centavos: 9990 };
+export const MAX_CARTAS_SEM_COTACAO = 20;
+
+// Preços aceitos no texto: os do manual (seção 2: Única 39,90, Trio 99,90,
+// Black Friday 99,90 e o frete da Única "entre R$ 8 e R$ 20") e toda soma
+// a×Única + b×Trio com a + 3b ≤ 20 cartas (ex.: 79,80, 139,80, 199,80).
+// Qualquer outro R$ (desconto, preço inventado, combinação acima de 20
+// cartas) passa pra humano.
+export const PRECOS_PERMITIDOS = (() => {
+  const s = new Set([800, 2000, UNICA.centavos, TRIO.centavos]);
+  for (let b = 0; b * TRIO.cartas <= MAX_CARTAS_SEM_COTACAO; b++) {
+    for (let a = 0; a * UNICA.cartas + b * TRIO.cartas <= MAX_CARTAS_SEM_COTACAO; a++) {
+      if (a + b > 0) s.add(a * UNICA.centavos + b * TRIO.centavos);
+    }
+  }
+  return s;
+})();
 
 // Prazos (manual, seção 3, pedido novo): arte em até 3 dias úteis, produção
 // em 4 dias úteis. "N dias úteis" com outro N passa pra humano (pega soma
@@ -151,6 +172,14 @@ export function quantidadeDeCartas(textoNormalizado) {
   return maior;
 }
 
+// O cliente fala de um pedido que JÁ existe ("meu pedido", "comprei", "já
+// paguei", "#1234", "pedido 1234"...). Sem isso, "correios", "entrega",
+// "endereço", "devolução" são pergunta de pré-venda e o modelo responde.
+const RE_PEDIDO_FEITO =
+  /\bmeu pedido|\bmeus pedidos|\bminha encomenda|\bminha compra|\bcomprei\b|\bpaguei\b|\bja pago\b|\bfiz (?:o|um|uma|meu|a|minha) (?:pedido|compra|encomenda)|\bfiz o pagamento|#\s?\d{2,}|\bpedido\s*(?:n[o.º°]?\s*)?#?\s*\d{3,}/;
+
+// re: vai pra humano sempre. reComPedido: só quando há contexto de pedido
+// já feito (RE_PEDIDO_FEITO). Ordem = prioridade do motivo.
 const PRE_CHECAGEM = [
   {
     motivo: "reclamacao",
@@ -158,15 +187,18 @@ const PRE_CHECAGEM = [
   },
   {
     motivo: "cancelamento",
-    re: /cancel|reembols|estorn|devolu|devolver|dinheiro de volta|arrependi/,
+    re: /cancel|reembols|estorn|dinheiro de volta|arrependi/,
+    reComPedido: /devolu|devolv/,
   },
   {
     motivo: "pagamento",
-    re: /paguei|ja pago|nao consegui pagar|pagamento (recusad|nao|falhou|deu erro|pendente)|cartao (recusad|nao passou)|recusad|cobrad[oa] (duas|2) vezes|cobranca|comprovante|pix (nao|errad)|nao caiu/,
+    re: /paguei|ja pago|nao consegui pagar|pagamento (recusad|nao|falhou|deu erro|pendente)|cartao (recusad|nao passou)|recusad|cobrad[oa] (duas|2) vezes|pix (nao|errad)|nao caiu/,
+    reComPedido: /cobranca|cobrad|comprovante|nota fiscal/,
   },
   {
     motivo: "entrega",
-    re: /rastreio|rastreamento|rastrear|nao chegou|ainda nao recebi|nao recebi|extravi|correios|transportadora|entregue|cade (o |a |meu |minha |as |os )?(pedido|carta|cartas|encomenda)|atrasad|atraso|endereco/,
+    re: /extravi|codigo de rastreio|\bmeu rastreio|cade (o |a |meu |minha |as |os )?(pedido|carta|cartas|encomenda)/,
+    reComPedido: /rastrei|rastrear|nao chegou|nao receb|correios|transportadora|entregue|entrega|endereco|atrasad|atraso|postad|chega quando|quando chega/,
   },
 ];
 
@@ -174,9 +206,12 @@ const PRE_CHECAGEM = [
 export function preChecagem(textoTurno) {
   const t = normalizar(textoTurno);
   if (!t.trim()) return null;
+  const pedido = RE_PEDIDO_FEITO.exec(t);
   for (const regra of PRE_CHECAGEM) {
     const m = regra.re.exec(t);
     if (m) return { motivo: regra.motivo, detalhe: `palavra-chave: "${m[0]}"` };
+    const c = pedido && regra.reComPedido?.exec(t);
+    if (c) return { motivo: regra.motivo, detalhe: `palavra-chave: "${c[0]}" com pedido já feito ("${pedido[0]}")` };
   }
   const n = quantidadeDeCartas(t);
   if (n > 20) return { motivo: "quantidade", detalhe: `${n} cartas (acima de 20 é cotação do Vini)` };
@@ -189,14 +224,58 @@ export function preChecagem(textoTurno) {
 // meio: (11) 98765-4321, +55 11 98765 4321, 987654321. Barra e vírgula NÃO
 // contam como separador, então data (24/11/2026) e preço (R$ 99,90) passam.
 const RE_TELEFONE = /(?:\+?\d[\s().\-]{0,3}){8,}/;
+// Não são telefone (tirados do texto antes do RE_TELEFONE): CNPJ formatado
+// (12.345.678/0001-90), CEP 01310-100 (5-3, sem dígito colado dos lados) e
+// 8 dígitos logo depois de "CEP" (CEP 01310100, CEP: 01.310-100).
+const RE_CNPJ = /(?<!\d)\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}(?!\d)/g;
+const RE_CEP = /(?<![\d.\-])\d{5}-\d{3}(?![\d.\-]?\d)|\bcep\b\W{0,3}\d{2}\.?\d{3}-?\d{3}(?!\d)/gi;
+
+export function temTelefone(texto) {
+  const s = String(texto ?? "").replace(RE_CNPJ, " ").replace(RE_CEP, " ");
+  return RE_TELEFONE.test(s);
+}
 
 export const blackFridayAtiva = (agoraMs) => agoraMs >= BLACK_FRIDAY_INICIO && agoraMs <= BLACK_FRIDAY_FIM;
 
-function precoNormalizado(bruto) {
-  const s = bruto.replace(/\./g, "").replace(",", ".");
-  const n = Number(s);
-  return Number.isFinite(n) ? n.toFixed(2) : null;
+// "1.234,5" → 123450 (centavos); null se não for número.
+function precoEmCentavos(bruto) {
+  const n = Number(bruto.replace(/\./g, "").replace(",", "."));
+  return Number.isFinite(n) ? Math.round(n * 100) : null;
 }
+
+// Prazo que soma etapas num número só ou que é do regime antigo (manual,
+// seção 3: "nunca some as etapas num número só"; 48 horas úteis é só de
+// pedido antigo, que o direct não consulta). "3 a 7 dias" (frete) e
+// "7 dias corridos" (arrependimento) passam.
+const NUMERO = "(?:\\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|quinze)";
+const RE_PRAZO_TOTAL = [
+  // 48h, 48 h, 48hs, 48 horas (úteis ou não)
+  /\b48\s*(?:h|hs|hrs?|horas?)\b/,
+  // "pronto em 7 dias", "chega em 10 dias", "fica pronta em até 7 dias"
+  new RegExp(`\\b(?:pront[oa]s?|fica(?:m)?|chega(?:m)?|receb\\w*|entreg\\w*)\\s+(?:em|com)\\s+(?:ate\\s+)?(?:uns\\s+)?${NUMERO}\\s+(?:dias?|semanas?)\\b(?!\\s+(?:uteis|corridos))`),
+  // "em até 7 dias", "em 10 dias" (sem "úteis", que tem regra própria, nem "corridos")
+  new RegExp(`\\bem\\s+(?:ate\\s+)?${NUMERO}\\s+dias?\\b(?!\\s+(?:uteis|corridos))`),
+  // "uma semana", "2 semanas"
+  new RegExp(`\\b${NUMERO}\\s+semanas?\\b`),
+  // "prazo total de 10 dias", "no total são 9 dias"
+  /\btotal\b[^.!?\n]{0,30}?\b\d+\s+dias?\b/,
+];
+
+// Só https de eternizacards.com.br (com ou sem www.), qualquer caminho,
+// query ou âncora. Sem usuário/senha nem porta (pega o truque
+// https://eternizacards.com.br@outro.site).
+export function linkPermitido(bruto) {
+  let u;
+  try {
+    u = new URL(/^www\./i.test(bruto) ? `https://${bruto}` : bruto);
+  } catch {
+    return false;
+  }
+  return u.protocol === "https:" && HOSTS_PERMITIDOS.has(u.hostname.toLowerCase()) && !u.username && !u.password && !u.port;
+}
+
+// Domínio sem http(s):// nem www. ("bit.ly/x", "wa.me/...", "outrosite.com").
+const RE_DOMINIO_SOLTO = /(?<![@\w.\/-])(?:[a-z0-9-]+\.)+(?:com|net|org|me|ly|io|br|app|link|co|gg|site|store|shop|info|bio)(?:\.[a-z]{2})?\b(?:\/[^\s]*)?/gi;
 
 // Devolve { motivo, detalhe } se o texto NÃO pode sair, senão null.
 export function travasDoTexto(texto, agoraMs) {
@@ -206,8 +285,7 @@ export function travasDoTexto(texto, agoraMs) {
   const bytes = bytesUtf8(s);
   if (bytes > LIMITE_BYTES_DM) return { motivo: "tamanho", detalhe: `${bytes} bytes (limite ${LIMITE_BYTES_DM})` };
 
-  const tel = RE_TELEFONE.exec(s);
-  if (tel) return { motivo: "telefone", detalhe: "sequência de 8+ dígitos no texto" };
+  if (temTelefone(s)) return { motivo: "telefone", detalhe: "sequência de 8+ dígitos no texto (não é CEP nem CNPJ)" };
 
   const t = normalizar(s);
   if (/\bblack\b|blackfriday/.test(t) && !blackFridayAtiva(agoraMs)) {
@@ -215,8 +293,10 @@ export function travasDoTexto(texto, agoraMs) {
   }
 
   for (const m of s.matchAll(/R\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)/g)) {
-    const p = precoNormalizado(m[1]);
-    if (!p || !PRECOS_DO_MANUAL.has(p)) return { motivo: "preco_fora_do_manual", detalhe: `preço "${m[0]}" não está no manual` };
+    const p = precoEmCentavos(m[1]);
+    if (p == null || !PRECOS_PERMITIDOS.has(p)) {
+      return { motivo: "preco_fora_do_manual", detalhe: `preço "${m[0]}" não está no manual nem é soma de planos até ${MAX_CARTAS_SEM_COTACAO} cartas` };
+    }
   }
 
   for (const m of t.matchAll(/(\d+)\s*(?:dias?|horas?)\s+uteis/g)) {
@@ -225,14 +305,36 @@ export function travasDoTexto(texto, agoraMs) {
       return { motivo: "prazo_fora_do_manual", detalhe: `prazo "${m[0]}" não é 3 (arte) nem 4 (produção) dias úteis` };
     }
   }
+  for (const re of RE_PRAZO_TOTAL) {
+    const m = re.exec(t);
+    if (m) return { motivo: "prazo_fora_do_manual", detalhe: `prazo "${m[0]}" soma etapas ou é do regime antigo` };
+  }
+
+  // Vocabulário (manual + contexto): antes do pagamento é "arte"; o texto
+  // não usa "prévia". Não tem falso positivo: nenhuma resposta certa usa a palavra.
+  if (/\bprevias?\b/.test(t)) return { motivo: "vocabulario_previa", detalhe: "o texto usa \"prévia\" (o certo é falar da arte, feita depois do pagamento)" };
 
   for (const m of s.matchAll(/(?:https?:\/\/|www\.)[^\s]+/gi)) {
-    const url = m[0].replace(/[).,!?]+$/, "");
-    if (url !== LINK_PEDIDO && !/^https:\/\/eternizacards\.com\.br\/?$/.test(url)) {
-      return { motivo: "link_fora_do_manual", detalhe: `link não permitido: ${url.slice(0, 120)}` };
-    }
+    const url = m[0].replace(/[).,!?;:]+$/, "");
+    if (!linkPermitido(url)) return { motivo: "link_fora_do_manual", detalhe: `link não permitido: ${url.slice(0, 120)}` };
+  }
+  const semLinks = s.replace(/(?:https?:\/\/|www\.)[^\s]+/gi, " ");
+  for (const m of semLinks.matchAll(RE_DOMINIO_SOLTO)) {
+    const dominio = m[0].replace(/[).,!?;:]+$/, "");
+    if (!linkPermitido(`https://${dominio}`)) return { motivo: "link_fora_do_manual", detalhe: `link não permitido: ${dominio.slice(0, 120)}` };
   }
   return null;
+}
+
+// Frase que vai pro cliente quando a conversa passa pra humano. DM_FRASE_HUMANO
+// troca o texto; se a da env não passar nas travas (telefone, link, preço,
+// tamanho...), usa a padrão e devolve o motivo pra logar.
+export function fraseHumano(env = process.env, agoraMs = Date.now()) {
+  const daEnv = String(env.DM_FRASE_HUMANO ?? "").trim();
+  if (!daEnv) return { texto: FRASE_HUMANO_PADRAO, recusada: null };
+  const trava = travasDoTexto(daEnv, agoraMs);
+  if (trava) return { texto: FRASE_HUMANO_PADRAO, recusada: trava.motivo };
+  return { texto: daEnv, recusada: null };
 }
 
 // ── Resposta do LLM ───────────────────────────────────────────────────────
@@ -311,17 +413,19 @@ export function contexto(agora) {
     "",
     "## Regras deste canal (valem mais que o manual)",
     "- Aqui você NÃO tem ferramentas: não existe consultar_pedido, link_pedido nem passar_para_humano. Você só devolve o JSON abaixo.",
-    "- Você não vê pedido nenhum. Qualquer coisa sobre um pedido já feito (pagamento, etapa, prazo de um pedido, rastreio, entrega, troca, endereço, ajuste de arte) → acao \"humano\".",
-    `- Link do pedido: só este, exatamente assim: ${LINK_PEDIDO} . Nunca outro link.`,
-    "- Preços: só os da tabela da seção 2 do manual, escritos como lá. Nunca some valores, nunca dê desconto, nunca invente preço.",
-    "- Prazo: a arte fica pronta em até 3 dias úteis depois que chegam as fotos e o nome; a produção leva 4 dias úteis depois que o cliente aprova a arte; o frete leva de 3 a 7 dias, contados da postagem. Nunca some as etapas num número só.",
-    "- Nunca mostre, prometa ou mande prévia antes do pagamento.",
-    "- Chame a ilustração da carta de \"arte\".",
+    "- Este direct é só pra tirar dúvida e levar o cliente a fazer o pedido no site. Aqui NÃO se recebe foto, NÃO se coleta nome e NÃO se aprova arte, e você não vê imagens (só sabe que veio um anexo). O pedido é feito no site eternizacards.com.br; depois de pagar, o cliente recebe um link pra mandar as fotos e os nomes (o pós-compra). Se ele mandar foto ou quiser mandar por aqui, agradeça com carinho e explique isso.",
+    "- Nunca mande o cliente pro WhatsApp: sem número de telefone, sem wa.me, sem \"chama no zap\".",
+    "- Do manual, IGNORE (é do WhatsApp e não vale aqui): a seção 3b inteira sobre saudação, origem, UTM e montagem do link (aqui o link é o de baixo); qualquer instrução de pedir, receber ou organizar fotos e nomes \"aqui\" na conversa (seções 4, 5 e 11); o regime antigo de 48 horas úteis; e a consulta de pedido por telefone ou número (seções 4, 13 e 14).",
+    "- Você não vê pedido nenhum. Qualquer coisa sobre um pedido já feito (pagamento, etapa, prazo de um pedido, rastreio, entrega, troca, devolução, endereço, envio de fotos de um pedido pago, ajuste de arte) → acao \"humano\".",
+    `- Link do pedido: este, exatamente assim: ${LINK_PEDIDO} . Não invente outro caminho do site e nunca mande link de outro domínio.`,
+    `- Preços: os da tabela da seção 2 do manual, escritos como lá. Pode somar os planos pra combinações até ${MAX_CARTAS_SEM_COTACAO} cartas (Única R$ 39,90 por 1 carta, Trio R$ 99,90 por 3 cartas; ex.: Trio + Única = 4 cartas por R$ 139,80; dois Trios = 6 cartas por R$ 199,80). Acima de ${MAX_CARTAS_SEM_COTACAO} cartas não dê preço: acao "humano" com motivo "COTAÇÃO". Nunca dê desconto, nunca invente preço.`,
+    "- Prazo: a arte fica pronta em até 3 dias úteis depois que chegam as fotos e o nome; a produção leva 4 dias úteis depois que o cliente aprova a arte; o frete leva de 3 a 7 dias, contados da postagem. Nunca some as etapas num número só (nada de \"pronto em 7 dias\", \"uma semana\" ou \"48 horas\").",
+    "- Antes do pagamento não existe arte. Se pedirem amostra ou pra ver antes de pagar, diga que a arte é feita depois do pagamento e só vai pra impressão depois do OK do cliente, com ajustes sem custo até ele aprovar. Fale sempre em \"arte\"; não use a palavra \"prévia\" na resposta.",
     "- Nunca escreva número de telefone ou de WhatsApp, nem peça o do cliente.",
     "- Não diga nada que não esteja no manual. Na dúvida, acao \"humano\".",
-    "- Acima de 20 cartas, reclamação, cancelamento, reembolso, problema de pagamento ou de entrega, pedido pra falar com uma pessoa, segurança → acao \"humano\".",
+    `- Acima de ${MAX_CARTAS_SEM_COTACAO} cartas, reclamação, cancelamento, reembolso, problema de pagamento ou de entrega, pedido já feito, pedido pra falar com uma pessoa, segurança → acao "humano".`,
     "- Elogio: responda normalmente (acao \"responder\") com motivo \"ELOGIO\".",
-    "- Quando a acao for \"humano\", o texto NÃO é enviado: o sistema avisa o Vini.",
+    "- Quando a acao for \"humano\", o texto que você escrever NÃO é enviado: um humano assume a conversa.",
     "- Responda em português, curto, no tom do manual. Uma mensagem só, até 600 caracteres.",
     "",
     "## Formato da resposta (obrigatório)",

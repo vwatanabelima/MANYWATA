@@ -10,17 +10,27 @@ import { readFileSync } from "node:fs";
 import handler, { processEvents } from "../api/webhook.js";
 import { CONTAS, contaPorSlug } from "../api/contas.js";
 import { confiancaMinima, maxPorJanela, autoRespostaLigada, TRAVA_MS } from "../api/_lib/dm.js";
-import { lerManual, MODELO_PADRAO, OPENROUTER_URL, modeloAgente } from "../api/_lib/dm-llm.js";
+import {
+  lerManual, MODELO_PADRAO, OPENROUTER_URL, modeloAgente,
+  separarManual, sha256, montarManual, REPO_PAINEL, CAMINHO_MANUAL_PAINEL,
+} from "../api/_lib/dm-llm.js";
 import { lerCredenciaisBanco } from "../api/_lib/dm-banco.js";
+import { avisarHumano, chatTelegram, textoAviso, sanitizarTelegram } from "../api/_lib/dm-aviso.js";
+import { executar as checarManual, buscarDoPainel } from "../scripts/checar-manual.mjs";
 import {
   classificarEvento,
   contexto,
+  fraseHumano,
   lerRespostaModelo,
+  linkPermitido,
   montarTurno,
   preChecagem,
   quantidadeDeCartas,
+  temTelefone,
   travasDoTexto,
+  FRASE_HUMANO_PADRAO,
   LINK_PEDIDO,
+  PRECOS_PERMITIDOS,
   normalizar,
 } from "../api/_lib/dm-regras.js";
 
@@ -36,6 +46,9 @@ const TOKEN = "token-falso-eterniza-so-para-teste-1234567890";
 const TOKEN_WATANABE = "token-falso-watanabe-so-para-teste-1234567890";
 const CHAVE_DB = "chave-falsa-service-role-so-para-teste-1234567890";
 const CHAVE_LLM = "chave-falsa-openrouter-so-para-teste-1234567890";
+const BOT_TELEGRAM = "123456789:token-falso-do-bot-telegram-so-para-teste";
+const CHAT_TELEGRAM = "987654";
+const TELEGRAM_URL = `https://api.telegram.org/bot${BOT_TELEGRAM}/sendMessage`;
 
 // segunda 16/11/2026 15:00 BRT
 const T0 = Date.parse("2026-11-16T15:00:00-03:00");
@@ -43,6 +56,7 @@ const HORA = 3600_000;
 
 const ENV_BASE = { DM_SUPABASE_URL: SUPA, DM_SUPABASE_SERVICE_ROLE_KEY: CHAVE_DB, OPENROUTER_API_KEY: CHAVE_LLM };
 const ENV_LIGADO = { ...ENV_BASE, DM_AUTO_RESPOSTA: "1" };
+const ENV_TELEGRAM = { ...ENV_LIGADO, TELEGRAM_BOT_TOKEN: BOT_TELEGRAM, TELEGRAM_CHAT_ID: CHAT_TELEGRAM };
 
 const TEXTO_OK = "O Trio sai por R$ 99,90 com frete grátis pro Brasil todo 😊";
 const RESPOSTA_OK = { acao: "responder", texto: TEXTO_OK, motivo: "", confianca: 0.92 };
@@ -82,7 +96,7 @@ const json = (status, corpo) =>
 const PADRAO = {
   ig_dm_conversas: {
     conta: "eterniza", ultima_entrada_em: null, ultima_saida_em: null,
-    humano: false, humano_motivo: null, humano_em: null,
+    humano: false, humano_motivo: null, humano_em: null, humano_frase_enviada_em: null,
     pausada_manual: false, pausada_motivo: null, pausada_em: null,
     respondendo_ate: null, trava_id: null, auto_respostas_janela: 0, janela_inicio_em: null,
     ultima_auto_texto: null, ultima_auto_em: null,
@@ -95,9 +109,9 @@ const CHECAGENS = {
   ig_dm_mensagens: (l) =>
     ["entrada", "saida_auto", "eco_manual"].includes(l.direcao) &&
     ["texto", "imagem", "video", "audio", "arquivo", "compartilhamento", "story", "anexo", "nao_suportado"].includes(l.tipo ?? "texto") &&
-    [null, undefined, "cliente", "llm", "comentario", "vinicius"].includes(l.origem) &&
+    [null, undefined, "cliente", "llm", "comentario", "vinicius", "sistema"].includes(l.origem) &&
     !!l.mid && !!l.enviada_em,
-  ig_dm_log: (l) => ["resposta", "humano", "erro_envio", "bloqueio"].includes(l.tipo),
+  ig_dm_log: (l) => ["resposta", "humano", "frase_humano", "erro_envio", "bloqueio"].includes(l.tipo),
   ig_dm_conversas: (l) => !!l.igsid,
 };
 
@@ -228,7 +242,7 @@ function bancoFalso() {
 
 const conteudoLlm = (r) => (typeof r === "string" ? r : JSON.stringify(r));
 
-function ambiente({ llm = RESPOSTA_OK, graph } = {}) {
+function ambiente({ llm = RESPOSTA_OK, graph, telegram } = {}) {
   const db = bancoFalso();
   const chamadas = [];
   let saidas = 0;
@@ -256,15 +270,27 @@ function ambiente({ llm = RESPOSTA_OK, graph } = {}) {
       return json(200, { recipient_id: corpo.recipient.id, message_id: `m_saida_${saidas}` });
     }
     if (/\/replies$/.test(u)) return json(200, { id: "resposta_publica_1" });
+    if (u.startsWith("https://api.telegram.org/")) {
+      if (telegram) {
+        const r = await telegram(u, JSON.parse(init.body));
+        if (r) return r;
+      }
+      return json(200, { ok: true, result: { message_id: 1 } });
+    }
     throw new Error(`rede de verdade não: ${u}`);
   });
+  const envios = () => chamadas.filter((c) => c.url === `${GRAPH}/me/messages` && c.corpo?.recipient?.id);
   return {
     db,
     fetch,
     chamadas,
-    envios: () => chamadas.filter((c) => c.url === `${GRAPH}/me/messages` && c.corpo?.recipient?.id),
+    envios,
+    // só a frase de humano / só o que não é a frase
+    frases: () => envios().filter((c) => c.corpo.message.text === FRASE_HUMANO_PADRAO),
+    respostas: () => envios().filter((c) => c.corpo.message.text !== FRASE_HUMANO_PADRAO),
     llms: () => chamadas.filter((c) => c.url === OPENROUTER_URL),
     supa: () => chamadas.filter((c) => c.url.startsWith(SUPA)),
+    telegram: () => chamadas.filter((c) => c.url.startsWith("https://api.telegram.org/")),
   };
 }
 
@@ -471,15 +497,17 @@ describe("comentário→DM inalterado", () => {
     expect(amb.fetch.mock.calls.slice(0, 2)).toEqual(CHAMADAS_COMENTARIO);
   });
 
-  test("LLM fora do ar (banco ok): comentário→DM igual, DM gravada, nada enviado", async () => {
+  test("LLM fora do ar (banco ok): comentário→DM igual, DM gravada, passa pra humano (só a frase sai)", async () => {
     usarAmbiente({ llm: () => json(503, { error: "indisponível" }) });
     const p = payloadComentario();
     p.entry[0].messaging = [entrada("m_y", "Quanto custa o trio?")];
     await rodar(p, ENV_LIGADO);
     expect(amb.fetch.mock.calls.slice(0, 2)).toEqual(CHAMADAS_COMENTARIO);
-    expect(amb.envios()).toHaveLength(0);
-    expect(amb.db.log("bloqueio")).toEqual([expect.objectContaining({ motivo: "erro_llm" })]);
-    expect(amb.db.conversa().humano).toBe(false);
+    expect(amb.respostas()).toHaveLength(0);
+    expect(amb.frases()).toHaveLength(1);
+    expect(amb.db.log("humano")).toEqual([expect.objectContaining({ motivo: "erro_llm" })]);
+    expect(amb.db.log("bloqueio")).toHaveLength(0);
+    expect(amb.db.conversa().humano).toBe(true);
   });
 
   test("erro inesperado dentro da DM não impede a próxima entry", async () => {
@@ -591,13 +619,17 @@ describe("resposta automática ligada", () => {
 // Passar pra humano
 // ══════════════════════════════════════════════════════════════════════════
 
+// Passou pra humano: o texto do LLM NÃO sai; sai só a frase de espera (uma vez).
 function esperaHumano(motivo) {
-  expect(amb.envios()).toHaveLength(0);
+  expect(amb.respostas()).toHaveLength(0);
+  expect(amb.frases()).toHaveLength(1);
   const c = amb.db.conversa();
   expect(c.humano).toBe(true);
   expect(c.humano_motivo).toBe(motivo);
   expect(c.humano_em).toBe(new Date(T0).toISOString());
+  expect(c.humano_frase_enviada_em).toBe(new Date(T0).toISOString());
   expect(amb.db.log("humano")).toEqual([expect.objectContaining({ igsid: IGSID, motivo })]);
+  expect(amb.db.log("frase_humano")).toEqual([expect.objectContaining({ igsid: IGSID, texto: FRASE_HUMANO_PADRAO })]);
 }
 
 describe("pré-checagem: humano sem chamar o LLM", () => {
@@ -609,6 +641,13 @@ describe("pré-checagem: humano sem chamar o LLM", () => {
     ["cartão recusado", "meu cartão recusado, e agora?", "pagamento"],
     ["entrega", "Cadê meu pedido? Não chegou ainda", "entrega"],
     ["rastreio", "me passa o código de rastreio", "entrega"],
+    ["correios com pedido", "Meu pedido ainda não chegou pelos correios", "entrega"],
+    ["não recebi depois de comprar", "comprei semana passada e não recebi nada", "entrega"],
+    ["endereço com número de pedido", "Fiz o pedido #1234, dá pra mudar o endereço?", "entrega"],
+    ["entregue com 'pedido 1234'", "o pedido 1234 aparece como entregue mas não está aqui", "entrega"],
+    ["devolução de compra feita", "quero devolver, comprei ontem", "cancelamento"],
+    ["comprovante depois de pagar", "fiz o pagamento, segue o comprovante", "pagamento"],
+    ["cobrança de pedido", "minha compra teve uma cobrança estranha", "pagamento"],
     ["25 cartas", "Quero fazer 25 cartas pra festa", "quantidade"],
     ["trinta cartas por extenso", "dá pra fazer trinta cartas?", "quantidade"],
   ])("%s → humano (%s)", async (_n, texto, motivo) => {
@@ -617,12 +656,28 @@ describe("pré-checagem: humano sem chamar o LLM", () => {
     esperaHumano(motivo);
   });
 
-  test("depois de humano, a próxima mensagem não chama o LLM nem envia", async () => {
+  test.each([
+    "Vocês entregam pelos correios?",
+    "Qual o prazo de entrega pro meu endereço?",
+    "Aceita devolução?",
+    "Vocês mandam comprovante de compra?",
+    "Como funciona a cobrança, é no cartão?",
+    "Entregam no Brasil todo? Moro no interior",
+    "Se eu não receber, o que acontece?",
+  ])("pré-venda com palavra de entrega/pagamento, sem pedido feito: o modelo responde (%s)", async (texto) => {
+    await rodar(payloadDm(entrada("m1", texto)), ENV_LIGADO);
+    expect(amb.llms()).toHaveLength(1);
+    expect(amb.respostas()).toHaveLength(1);
+    expect(amb.db.conversa().humano).toBe(false);
+  });
+
+  test("depois de humano, a próxima mensagem não chama o LLM nem envia (nem a frase de novo)", async () => {
     await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
     await rodar(payloadDm(entrada("m2", "Quanto custa o trio?")), ENV_LIGADO);
     expect(amb.llms()).toHaveLength(0);
-    expect(amb.envios()).toHaveLength(0);
-    expect(amb.db.mensagens()).toHaveLength(2);
+    expect(amb.envios()).toHaveLength(1);
+    expect(amb.frases()).toHaveLength(1);
+    expect(amb.db.mensagens().filter((m) => m.direcao === "entrada")).toHaveLength(2);
   });
 });
 
@@ -639,9 +694,13 @@ describe("decisão do modelo e travas no texto", () => {
     ["sequência de 8+ dígitos", { ...RESPOSTA_OK, texto: "Fala com a gente: 11987654321" }, "telefone"],
     ["Black Friday antes de 24/11", { ...RESPOSTA_OK, texto: "Na Black Friday vai ter 5 cartas por R$ 99,90!" }, "black_friday"],
     ["acima de 1000 bytes", { ...RESPOSTA_OK, texto: "á".repeat(501) }, "tamanho"],
-    ["preço fora do manual", { ...RESPOSTA_OK, texto: "Trio + Única sai R$ 139,80" }, "preco_fora_do_manual"],
+    ["preço fora do manual", { ...RESPOSTA_OK, texto: "Trio + Única sai R$ 149,90" }, "preco_fora_do_manual"],
+    ["soma acima de 20 cartas", { ...RESPOSTA_OK, texto: "Sete Trios saem R$ 699,30" }, "preco_fora_do_manual"],
     ["prazo somado", { ...RESPOSTA_OK, texto: "Fica pronto em 7 dias úteis" }, "prazo_fora_do_manual"],
+    ["48 horas", { ...RESPOSTA_OK, texto: "A arte fica pronta em 48 horas" }, "prazo_fora_do_manual"],
     ["link de fora", { ...RESPOSTA_OK, texto: "Olha aqui: https://bit.ly/xyz" }, "link_fora_do_manual"],
+    ["wa.me", { ...RESPOSTA_OK, texto: "Chama a gente: https://wa.me/eternizacards" }, "link_fora_do_manual"],
+    ["palavra prévia", { ...RESPOSTA_OK, texto: "A gente não faz prévia antes do pedido 😊" }, "vocabulario_previa"],
   ])("%s → humano, nada enviado", async (_n, resposta, motivo) => {
     usarAmbiente({ llm: resposta });
     await rodar(payloadDm(entrada("m1", "Quanto custa o trio?")), ENV_LIGADO);
@@ -679,6 +738,13 @@ describe("decisão do modelo e travas no texto", () => {
     expect(amb.envios()).toHaveLength(1);
     expect(amb.db.conversa().humano).toBe(false);
     expect(amb.db.log("resposta")[0].motivo).toBe("ELOGIO");
+  });
+
+  test("soma de planos até 20 cartas sai (Trio + Única = R$ 139,80)", async () => {
+    const texto = "Trio + Única dá 4 cartas por R$ 139,80, e dois Trios saem R$ 199,80 😊";
+    usarAmbiente({ llm: { ...RESPOSTA_OK, texto } });
+    await rodar(payloadDm(entrada("m1", "quanto fica 4 cartas?")), ENV_LIGADO);
+    expect(amb.respostas().map((c) => c.corpo.message.text)).toEqual([texto]);
   });
 
   test("conversa já com humano: não chama o LLM nem envia", async () => {
@@ -786,14 +852,18 @@ describe("limite de respostas por janela", () => {
     await rodar(payloadDm(entrada("m1", "Oi")), env);
     await rodar(payloadDm(entrada("m2", "Quanto custa?")), env);
     await rodar(payloadDm(entrada("m3", "E o prazo?")), env);
-    expect(amb.envios()).toHaveLength(2);
+    expect(amb.respostas()).toHaveLength(2);
+    expect(amb.frases()).toHaveLength(1);
     expect(amb.llms()).toHaveLength(2);
     esperaHumanoSemZerarEnvios("limite_respostas");
+    // a frase não conta como resposta automática
+    expect(amb.db.conversa().auto_respostas_janela).toBe(2);
   });
 
   test("padrão 5", async () => {
     for (let i = 1; i <= 6; i++) await rodar(payloadDm(entrada(`m${i}`, "oi de novo")), ENV_LIGADO);
-    expect(amb.envios()).toHaveLength(5);
+    expect(amb.respostas()).toHaveLength(5);
+    expect(amb.frases()).toHaveLength(1);
     expect(amb.db.conversa().humano_motivo).toBe("limite_respostas");
   });
 
@@ -924,33 +994,284 @@ describe("evitar resposta duplicada", () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("falha no envio", () => {
-  test("Graph recusa: log 'erro_envio' sanitizado (sem token), nada gravado como saída", async () => {
+  test("Graph recusa: log 'erro_envio' sanitizado (sem token), passa pra humano, frase tentada UMA vez, nada gravado como saída", async () => {
     usarAmbiente({
       graph: async () => json(400, { error: { message: `Invalid OAuth access token. access_token=${TOKEN} Bearer ${TOKEN}`, code: 190 } }),
     });
-    await rodar(payloadDm(entrada("m1", "Quanto custa o trio?")), ENV_LIGADO);
-    expect(amb.envios()).toHaveLength(1);
-    const [erro] = amb.db.log("erro_envio");
-    expect(erro).toMatchObject({ igsid: IGSID, mid_entrada: "m1", texto: TEXTO_OK });
+    await rodar(payloadDm(entrada("m1", "Quanto custa o trio?")), ENV_TELEGRAM);
+    // a resposta do LLM + a frase (tentativa única), as duas recusadas
+    expect(amb.envios().map((c) => c.corpo.message.text)).toEqual([TEXTO_OK, FRASE_HUMANO_PADRAO]);
+    const [erro, erroFrase] = amb.db.log("erro_envio");
+    expect(erro).toMatchObject({ igsid: IGSID, mid_entrada: "m1", texto: TEXTO_OK, motivo: "envio_falhou" });
+    expect(erroFrase).toMatchObject({ igsid: IGSID, motivo: "frase_humano", texto: FRASE_HUMANO_PADRAO });
     expect(erro.detalhe).toMatch(/Graph 400/);
     expect(erro.detalhe).not.toContain(TOKEN);
+    const c = amb.db.conversa();
+    expect(c).toMatchObject({ humano: true, humano_motivo: "envio_falhou", respondendo_ate: null });
+    expect(amb.db.log("humano")).toEqual([expect.objectContaining({ motivo: "envio_falhou" })]);
+    expect(amb.db.log("frase_humano")).toHaveLength(0);
+    // aviso ao Vini saiu, sem token nenhum
+    expect(amb.telegram()).toHaveLength(1);
+    expect(amb.telegram()[0].corpo.text).toContain("envio_falhou");
+    expect(JSON.stringify(amb.telegram()[0].corpo)).not.toContain(TOKEN);
     expect(JSON.stringify(amb.db.t)).not.toContain(TOKEN);
     expect(logsDoConsole()).not.toContain(TOKEN);
     expect(amb.db.mensagens().filter((m) => m.direcao === "saida_auto")).toHaveLength(0);
-    expect(amb.db.conversa().respondendo_ate).toBeNull();
   });
 
-  test("rede caiu no envio: log 'erro_envio', webhook segue", async () => {
+  test("Graph falha só na resposta: a frase sai e a conversa fica com humano", async () => {
+    let n = 0;
+    usarAmbiente({ graph: async () => (++n === 1 ? json(500, { error: { message: "erro interno" } }) : null) });
+    await rodar(payloadDm(entrada("m1", "Quanto custa o trio?")), ENV_LIGADO);
+    expect(amb.envios()).toHaveLength(2);
+    expect(amb.db.mensagens().filter((m) => m.direcao === "saida_auto")).toEqual([
+      expect.objectContaining({ texto: FRASE_HUMANO_PADRAO, origem: "sistema" }),
+    ]);
+    expect(amb.db.conversa()).toMatchObject({ humano: true, humano_motivo: "envio_falhou" });
+  });
+
+  test("rede caiu no envio: log 'erro_envio', humano, webhook segue", async () => {
     usarAmbiente({ graph: async () => { throw new Error(`socket hang up ${TOKEN}`); } });
     await expect(rodar(payloadDm(entrada("m1", "oi")), ENV_LIGADO)).resolves.toBeUndefined();
     expect(amb.db.log("erro_envio")[0].detalhe).not.toContain(TOKEN);
+    expect(amb.db.conversa().humano).toBe(true);
   });
 
-  test("erro do OpenRouter não vaza a chave", async () => {
+  test("erro do OpenRouter não vaza a chave (nem no log, nem no banco, nem no aviso)", async () => {
     usarAmbiente({ llm: () => json(401, { error: `chave inválida ${CHAVE_LLM}` }) });
-    await rodar(payloadDm(entrada("m1", "oi")), ENV_LIGADO);
-    expect(amb.db.log("bloqueio")[0].detalhe).not.toContain(CHAVE_LLM);
+    await rodar(payloadDm(entrada("m1", "oi")), ENV_TELEGRAM);
+    expect(amb.db.log("humano")[0]).toMatchObject({ motivo: "erro_llm" });
+    expect(amb.db.log("humano")[0].detalhe).not.toContain(CHAVE_LLM);
     expect(logsDoConsole()).not.toContain(CHAVE_LLM);
+    expect(JSON.stringify(amb.telegram())).not.toContain(CHAVE_LLM);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Falha do OpenRouter → humano
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("falha do OpenRouter passa pra humano", () => {
+  test.each([
+    ["5xx", () => json(502, { error: "bad gateway" })],
+    ["429", () => json(429, { error: "rate limit" })],
+    ["rede", () => { throw new TypeError("fetch failed"); }],
+    ["timeout", () => { throw new DOMException("The operation was aborted due to timeout", "TimeoutError"); }],
+  ])("%s → humano (erro_llm) + frase + aviso", async (_n, llm) => {
+    usarAmbiente({ llm });
+    await rodar(payloadDm(entrada("m1", "Quanto custa o trio?")), ENV_TELEGRAM);
+    esperaHumano("erro_llm");
+    expect(amb.db.log("humano")[0]).toMatchObject({ mid_entrada: "m1", modelo: MODELO_PADRAO });
+    expect(amb.telegram()).toHaveLength(1);
+    expect(amb.telegram()[0].corpo.text).toContain("Motivo: erro_llm");
+  });
+
+  test("sem OPENROUTER_API_KEY continua 'bloqueio' (é config, não falha)", async () => {
+    await rodar(payloadDm(entrada("m1", "oi")), { ...ENV_LIGADO, OPENROUTER_API_KEY: "" });
+    expect(amb.db.log("bloqueio")).toEqual([expect.objectContaining({ motivo: "sem_chave_llm" })]);
+    expect(amb.db.conversa().humano).toBe(false);
+    expect(amb.envios()).toHaveLength(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Frase pro cliente ao passar pra humano
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("frase ao passar pra humano", () => {
+  test("sai uma vez, gravada como saida_auto origem 'sistema', com log 'frase_humano'", async () => {
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
+    expect(amb.frases()).toHaveLength(1);
+    expect(amb.frases()[0].corpo).toEqual({ recipient: { id: IGSID }, message: { text: FRASE_HUMANO_PADRAO } });
+    expect(amb.db.mensagens().find((m) => m.direcao === "saida_auto")).toMatchObject({
+      mid: "m_saida_1", texto: FRASE_HUMANO_PADRAO, origem: "sistema", tipo: "texto",
+    });
+    expect(amb.db.log("frase_humano")).toEqual([expect.objectContaining({ mid_entrada: "m1", mid_saida: "m_saida_1" })]);
+    expect(amb.db.conversa()).toMatchObject({ ultima_auto_texto: FRASE_HUMANO_PADRAO, ultima_saida_em: new Date(T0).toISOString() });
+  });
+
+  test("a frase padrão não tem telefone nem link e passa nas travas", () => {
+    expect(travasDoTexto(FRASE_HUMANO_PADRAO, T0)).toBeNull();
+    expect(FRASE_HUMANO_PADRAO).toBe("Vou chamar o Vini pra te ajudar com isso, ele te responde aqui rapidinho 😊");
+  });
+
+  test("DM_FRASE_HUMANO troca o texto", async () => {
+    const frase = "Já chamei o Vini, ele te responde por aqui 💜";
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), { ...ENV_LIGADO, DM_FRASE_HUMANO: `  ${frase} ` });
+    expect(amb.envios().map((c) => c.corpo.message.text)).toEqual([frase]);
+  });
+
+  test.each([
+    ["telefone", "Chama o Vini no (11) 98765-4321"],
+    ["wa.me", "Fala com o Vini: wa.me/5511"],
+    ["link de fora", "Vini: https://bit.ly/vini"],
+    ["tamanho", "a".repeat(1001)],
+  ])("DM_FRASE_HUMANO com %s: recusada, usa a padrão e avisa no log", async (_n, frase) => {
+    expect(fraseHumano({ DM_FRASE_HUMANO: frase }, T0)).toMatchObject({ texto: FRASE_HUMANO_PADRAO });
+    expect(fraseHumano({ DM_FRASE_HUMANO: frase }, T0).recusada).toBeTruthy();
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), { ...ENV_LIGADO, DM_FRASE_HUMANO: frase });
+    expect(amb.envios().map((c) => c.corpo.message.text)).toEqual([FRASE_HUMANO_PADRAO]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/DM_FRASE_HUMANO recusada/));
+  });
+
+  test("PATCH atômico: só pega conversa com humano, sem pausa e sem frase ainda", async () => {
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
+    const patch = amb.supa().find((c) => c.metodo === "PATCH" && c.corpo?.humano_frase_enviada_em);
+    const p = new URL(patch.url).searchParams;
+    expect(p.get("igsid")).toBe(`eq.${IGSID}`);
+    expect(p.get("humano")).toBe("is.true");
+    expect(p.get("pausada_manual")).toBe("is.false");
+    expect(p.get("humano_frase_enviada_em")).toBe("is.null");
+    expect(patch.init.headers.Prefer).toBe("return=representation");
+    // o texto é marcado antes do POST (pro eco ser reconhecido)
+    expect(patch.corpo.ultima_auto_texto).toBe(FRASE_HUMANO_PADRAO);
+  });
+
+  test("conversa que já recebeu a frase nesta marcação: não manda de novo", async () => {
+    amb.db.semear("ig_dm_conversas", { igsid: IGSID, humano_frase_enviada_em: new Date(T0 - HORA).toISOString() });
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
+    expect(amb.db.conversa().humano).toBe(true);
+    expect(amb.envios()).toHaveLength(0);
+    expect(amb.db.log("frase_humano")).toHaveLength(0);
+  });
+
+  test("duas execuções passando a mesma conversa pra humano ao mesmo tempo: 1 frase", async () => {
+    // o LLM das duas pede humano; a segunda chega com a trava ocupada e desiste,
+    // e mesmo que não desistisse o PATCH condicional segura
+    usarAmbiente({ llm: { acao: "humano", texto: "", motivo: "OUTRO", confianca: 0.9 } });
+    await Promise.all([
+      rodar(payloadDm(entrada("m1", "Oi")), ENV_LIGADO),
+      rodar(payloadDm(entrada("m2", "tenho uma dúvida")), ENV_LIGADO),
+    ]);
+    expect(amb.frases()).toHaveLength(1);
+  });
+
+  test("janela de 24h fecha enquanto o LLM pensa: marca humano e avisa, mas NÃO manda a frase", async () => {
+    usarAmbiente({ llm: { acao: "humano", texto: "", motivo: "OUTRO", confianca: 0.9 } });
+    const relogio = { t: T0 };
+    const llmOriginal = amb.fetch.getMockImplementation();
+    amb.fetch.mockImplementation(async (url, init) => {
+      const r = await llmOriginal(url, init);
+      if (String(url) === OPENROUTER_URL) relogio.t += 20_000; // o LLM levou 20s
+      return r;
+    });
+    // última mensagem do cliente há 23h59m50s
+    await processEvents(payloadDm(entrada("m1", "oi", { ts: T0 - 24 * HORA + 10_000 })), { env: ENV_TELEGRAM, now: () => relogio.t });
+    expect(amb.llms()).toHaveLength(1);
+    expect(amb.envios()).toHaveLength(0);
+    expect(amb.db.conversa()).toMatchObject({ humano: true, humano_frase_enviada_em: null });
+    expect(amb.telegram()).toHaveLength(1);
+  });
+
+  test("eco da frase (chegando antes de gravarmos o mid) não pausa; depois o Vinicius responde e pausa", async () => {
+    usarAmbiente({
+      graph: async (corpo) => {
+        await rodar(payloadDm(eco("m_saida_1", corpo.message.text)), ENV_LIGADO);
+      },
+    });
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
+    expect(amb.db.conversa().pausada_manual).toBe(false);
+    expect(amb.db.mensagens().find((m) => m.mid === "m_saida_1")).toMatchObject({ direcao: "saida_auto", origem: "sistema" });
+    await rodar(payloadDm(eco("m_saida_1", FRASE_HUMANO_PADRAO)), ENV_LIGADO); // reentrega do eco
+    expect(amb.db.conversa().pausada_manual).toBe(false);
+    await rodar(payloadDm(eco("m_vini", "Oi! Aqui é o Vini, me conta")), ENV_LIGADO);
+    expect(amb.db.conversa().pausada_manual).toBe(true);
+  });
+
+  test("banco falha ao marcar humano: o aviso sai mesmo assim, a frase não", async () => {
+    usarAmbiente({ llm: { acao: "humano", texto: "", motivo: "OUTRO", confianca: 0.9 } });
+    amb.db.estado.falha = (tabela, metodo) => {
+      if (tabela !== "ig_dm_conversas" || metodo !== "PATCH") return false;
+      return amb.supa().at(-1)?.corpo?.humano === true;
+    };
+    await rodar(payloadDm(entrada("m1", "oi")), ENV_TELEGRAM);
+    expect(amb.telegram()).toHaveLength(1);
+    expect(amb.envios()).toHaveLength(0);
+    expect(logsDoConsole()).toMatch(/falhou marcar humano/);
+    expect(logsDoConsole()).not.toContain(CHAVE_DB);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Aviso ao Vinicius (dm-aviso.js)
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("aviso ao Vinicius", () => {
+  test("sem TELEGRAM_*: nenhuma chamada ao Telegram, só console", async () => {
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_LIGADO);
+    expect(amb.telegram()).toHaveLength(0);
+    expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/aviso de humano \(cancelamento\) — canais: nenhum \(só banco\)/));
+  });
+
+  test.each([
+    ["só o token", { TELEGRAM_BOT_TOKEN: BOT_TELEGRAM }],
+    ["só o chat", { TELEGRAM_CHAT_ID: CHAT_TELEGRAM }],
+    ["chat inválido", { TELEGRAM_BOT_TOKEN: BOT_TELEGRAM, TELEGRAM_CHAT_ID: "abc" }],
+  ])("%s: Telegram desligado", async (_n, extra) => {
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), { ...ENV_LIGADO, ...extra });
+    expect(amb.telegram()).toHaveLength(0);
+    expect(amb.db.conversa().humano).toBe(true);
+  });
+
+  test("com TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID: sendMessage no padrão do painel, sem token no texto", async () => {
+    await rodar(payloadDm(entrada("m1", "Quero cancelar meu pedido, comprei errado")), ENV_TELEGRAM);
+    const [chamada] = amb.telegram();
+    expect(chamada.url).toBe(TELEGRAM_URL);
+    expect(chamada.metodo).toBe("POST");
+    expect(chamada.corpo).toEqual({ chat_id: Number(CHAT_TELEGRAM), text: expect.any(String), disable_web_page_preview: true });
+    const t = chamada.corpo.text;
+    expect(t).toContain("Motivo: cancelamento");
+    expect(t).toContain(`IGSID: ${IGSID}`);
+    expect(t).toContain('Cliente: "Quero cancelar meu pedido, comprei errado"');
+    expect(t).toContain("ig_dm_pendentes_humano");
+    for (const segredo of [BOT_TELEGRAM, TOKEN, CHAVE_DB, CHAVE_LLM]) expect(t).not.toContain(segredo);
+    expect(t.length).toBeLessThanOrEqual(4000);
+  });
+
+  test("Telegram recusa (com o token no corpo do erro): log sanitizado e o resto segue", async () => {
+    usarAmbiente({ telegram: async () => json(401, { ok: false, description: `Unauthorized bot${BOT_TELEGRAM}` }) });
+    await rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_TELEGRAM);
+    expect(amb.frases()).toHaveLength(1);
+    expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/aviso por telegram falhou: Telegram 401/));
+    expect(logsDoConsole()).not.toContain(BOT_TELEGRAM);
+    expect(logsDoConsole()).not.toContain(BOT_TELEGRAM.split(":")[1]);
+  });
+
+  test("rede do Telegram cai com a URL (e o token) na mensagem: log sanitizado, nada lança", async () => {
+    usarAmbiente({ telegram: async (url) => { throw new TypeError(`request to ${url} failed, reason: ECONNRESET`); } });
+    await expect(rodar(payloadDm(entrada("m1", "Quero cancelar")), ENV_TELEGRAM)).resolves.toBeUndefined();
+    expect(logsDoConsole()).toMatch(/aviso por telegram falhou/);
+    expect(logsDoConsole()).not.toContain(BOT_TELEGRAM.split(":")[1]);
+    expect(amb.db.conversa().humano).toBe(true);
+  });
+
+  test("avisarHumano direto: interface de canais e nunca lança", async () => {
+    const fetchFalso = vi.fn(async () => json(200, { ok: true }));
+    expect(await avisarHumano({ igsid: "1", motivo: "x" }, { env: {}, fetch: fetchFalso })).toEqual({});
+    expect(fetchFalso).not.toHaveBeenCalled();
+    const env = { TELEGRAM_BOT_TOKEN: BOT_TELEGRAM, TELEGRAM_CHAT_ID: CHAT_TELEGRAM };
+    expect(await avisarHumano({ igsid: "1", motivo: "x" }, { env, fetch: fetchFalso })).toEqual({ telegram: "ok" });
+    const quebrado = vi.fn(async () => { throw new Error("boom"); });
+    expect(await avisarHumano({ igsid: "1", motivo: "x" }, { env, fetch: quebrado })).toEqual({ telegram: "erro" });
+  });
+
+  test("chat do Telegram como o painel lê (aspas, grupo negativo)", () => {
+    expect(chatTelegram({ TELEGRAM_CHAT_ID: ' "987654" ' })).toBe(987654);
+    expect(chatTelegram({ TELEGRAM_CHAT_ID: "-100123" })).toBe(-100123);
+    expect(chatTelegram({ TELEGRAM_CHAT_ID: "" })).toBeNull();
+    expect(chatTelegram({})).toBeNull();
+  });
+
+  test("texto do aviso: trecho curto do cliente, sem detalhe gigante", () => {
+    const t = textoAviso({ igsid: "9", motivo: "erro_llm", detalhe: "x".repeat(2000), ultimoTexto: "y".repeat(2000) });
+    expect(t.length).toBeLessThan(1000);
+    expect(t).toContain("Motivo: erro_llm");
+  });
+
+  test("sanitizarTelegram tira o token do bot de URL e de texto", () => {
+    const env = { TELEGRAM_BOT_TOKEN: BOT_TELEGRAM };
+    expect(sanitizarTelegram(`falhou ${TELEGRAM_URL}`, env)).not.toContain(BOT_TELEGRAM.split(":")[1]);
+    expect(sanitizarTelegram("https://api.telegram.org/bot111:outro-token-qualquer/sendMessage", {})).toContain("bot[oculto]");
   });
 });
 
@@ -994,7 +1315,8 @@ describe("travasDoTexto", () => {
     ["48 horas úteis", "prazo_fora_do_manual"],
     ["5 dias úteis", "prazo_fora_do_manual"],
     ["www.outrosite.com", "link_fora_do_manual"],
-    ["https://eternizacards.com.br/?cupom=100", "link_fora_do_manual"],
+    ["A gente não faz prévia, mas a arte só vai pra impressão depois do seu OK", "vocabulario_previa"],
+    ["Sem previas antes do pagamento", "vocabulario_previa"],
   ])("bloqueia: %s → %s", (texto, motivo) => {
     expect(travasDoTexto(texto, antes)?.motivo).toBe(motivo);
   });
@@ -1002,6 +1324,161 @@ describe("travasDoTexto", () => {
   test("1000 bytes UTF-8 (não caracteres)", () => {
     expect(travasDoTexto("é".repeat(500), antes)).toBeNull(); // 1000 bytes
     expect(travasDoTexto("é".repeat(501), antes)?.motivo).toBe("tamanho");
+  });
+
+  test("\"prévia\" só pega a palavra (previamente, prévio passam)", () => {
+    expect(travasDoTexto("Como combinamos previamente, a arte é feita depois do pagamento.", antes)).toBeNull();
+    expect(travasDoTexto("A arte é feita depois do pagamento, sem aviso prévio de nada.", antes)).toBeNull();
+  });
+});
+
+describe("trava de telefone (CEP e CNPJ não são telefone)", () => {
+  test.each([
+    "(11) 98765-4321",
+    "11 98765-4321",
+    "11987654321",
+    "+55 11 98765-4321",
+    "+5511987654321",
+    "55 (11) 9 8765 4321",
+    "98765-4321",
+    "3456-7890",
+    "(11) 3456-7890",
+    "0800 123 4567",
+    "01310100",
+    "12345678",
+    "987.654.321",
+  ])("pega: %s", (texto) => {
+    expect(temTelefone(`fala com a gente: ${texto}`)).toBe(true);
+    expect(travasDoTexto(`fala com a gente: ${texto}`, T0)?.motivo).toBe("telefone");
+  });
+
+  test.each([
+    "CNPJ 12.345.678/0001-90",
+    "nosso CNPJ é 12.345.678/0001-90.",
+    "CEP 01310-100",
+    "o CEP 01310-100 é atendido",
+    "01310-100",
+    "CEP 01310100",
+    "CEP: 01310100",
+    "cep 01.310-100",
+    "R$ 99,90 em 24/11/2026",
+    "63x88mm",
+  ])("não pega: %s", (texto) => {
+    expect(temTelefone(texto)).toBe(false);
+    expect(travasDoTexto(texto, T0)).toBeNull();
+  });
+
+  test("CEP colado num telefone não esconde o telefone", () => {
+    expect(temTelefone("CEP 01310-100, tel (11) 98765-4321")).toBe(true);
+  });
+});
+
+describe("trava de preço: somas de planos até 20 cartas", () => {
+  test.each([
+    ["R$ 79,80", "2 Únicas"],
+    ["R$ 139,80", "Trio + Única"],
+    ["R$ 199,80", "2 Trios"],
+    ["R$ 239,70", "2 Trios + 1 Única"],
+    ["R$ 679,20", "6 Trios + 2 Únicas = 20 cartas"],
+    ["R$ 798,00", "20 Únicas"],
+    ["R$ 99,90", "Trio / Black Friday"],
+    ["R$ 39,90", "Única"],
+    ["R$ 8", "frete mínimo"],
+    ["R$ 20", "frete máximo"],
+  ])("passa: %s (%s)", (preco) => {
+    expect(travasDoTexto(`Fica ${preco} 😊`, T0)).toBeNull();
+  });
+
+  test.each([
+    ["R$ 699,30", "7 Trios = 21 cartas"],
+    ["R$ 837,90", "21 Únicas"],
+    ["R$ 719,10", "6 Trios + 3 Únicas = 21 cartas"],
+    ["R$ 49,90", "inventado"],
+    ["R$ 89,90", "desconto"],
+    ["R$ 0,00", "zero"],
+  ])("bloqueia: %s (%s)", (preco) => {
+    expect(travasDoTexto(`Fica ${preco} 😊`, T0)?.motivo).toBe("preco_fora_do_manual");
+  });
+
+  test("o conjunto é exatamente a×39,90 + b×99,90 com a + 3b ≤ 20, mais o frete", () => {
+    let esperado = 0;
+    for (let b = 0; b <= 6; b++) for (let a = 0; a + 3 * b <= 20; a++) if (a + b > 0) esperado++;
+    // sem colisão entre combinações; + frete R$ 8 e R$ 20
+    expect(PRECOS_PERMITIDOS.size).toBe(esperado + 2);
+    expect(PRECOS_PERMITIDOS.has(13980)).toBe(true);
+    expect(PRECOS_PERMITIDOS.has(69930)).toBe(false);
+  });
+});
+
+describe("trava de prazo", () => {
+  test.each([
+    "A arte fica pronta em até 3 dias úteis depois que chegam as fotos e o nome.",
+    "Depois que você aprovar, são 4 dias úteis de produção.",
+    "O frete leva de 3 a 7 dias, contados da postagem.",
+    "O frete chega em 3 a 7 dias, dependendo da região.",
+    "Você pode desistir em até 7 dias corridos depois de receber.",
+    "O arrependimento vale até 7 dias corridos depois de receber as cartas.",
+    "Eu atendo 24 horas, todos os dias 😊",
+    "A Black Friday vai de 24/11 a 30/11.",
+    "Funciona no fim de semana também.",
+  ])("passa: %s", (texto) => {
+    expect(travasDoTexto(texto, Date.parse("2026-11-25T10:00:00-03:00"))).toBeNull();
+  });
+
+  test.each([
+    "A arte fica pronta em 48h",
+    "A arte fica pronta em 48 h",
+    "A arte sai em 48 horas",
+    "Em 48hs você recebe a arte",
+    "Fica pronto em 7 dias",
+    "Fica tudo pronto em 7 dias úteis",
+    "Chega em até 7 dias",
+    "Em até 10 dias está na sua casa",
+    "Fica pronta em uma semana",
+    "Em duas semanas chega",
+    "No total são 14 dias do pedido até a entrega",
+    "Você recebe em 9 dias",
+  ])("bloqueia: %s", (texto) => {
+    expect(travasDoTexto(texto, T0)?.motivo).toBe("prazo_fora_do_manual");
+  });
+});
+
+describe("trava de link", () => {
+  test.each([
+    LINK_PEDIDO,
+    "https://eternizacards.com.br",
+    "https://eternizacards.com.br/",
+    "https://www.eternizacards.com.br/trocas",
+    "https://eternizacards.com.br/pedido?plano=trio",
+    "https://eternizacards.com.br/pedido?plano=trio&utm_source=instagram&utm_medium=dm&utm_campaign=direct",
+    "https://eternizacards.com.br/?cupom=100",
+    "https://eternizacards.com.br/trocas#arrependimento",
+    "www.eternizacards.com.br/trocas",
+    "eternizacards.com.br/trocas",
+  ])("passa: %s", (url) => {
+    expect(travasDoTexto(`Dá uma olhada: ${url}.`, T0)).toBeNull();
+  });
+
+  test.each([
+    "https://wa.me/5511",
+    "wa.me/eternizacards",
+    "https://api.whatsapp.com/send?text=oi",
+    "http://eternizacards.com.br/trocas",
+    "https://eternizacards.com.br.golpe.com/pedido",
+    "https://eternizacards.com.br@golpe.com/",
+    "https://eternizacards.com.br:8443/",
+    "https://bit.ly/xyz",
+    "bit.ly/xyz",
+    "https://loja.eternizacards.com.br/",
+    "https://instagram.com/eternizacards",
+  ])("bloqueia: %s", (url) => {
+    expect(travasDoTexto(`Dá uma olhada: ${url}`, T0)?.motivo).toBe("link_fora_do_manual");
+  });
+
+  test("linkPermitido", () => {
+    expect(linkPermitido("https://eternizacards.com.br/qualquer/coisa?x=1")).toBe(true);
+    expect(linkPermitido("https://outro.com.br/")).toBe(false);
+    expect(linkPermitido("nao é url")).toBe(false);
   });
 });
 
@@ -1014,8 +1491,38 @@ describe("preChecagem", () => {
     "Como funciona o prazo?",
     "Oi",
     "",
+    // pré-venda: palavra de entrega/pagamento/devolução sem pedido feito
+    "Vocês entregam pelos correios?",
+    "Qual o prazo de entrega pro meu endereço?",
+    "Aceita devolução?",
+    "E se eu quiser devolver?",
+    "Tem código de barras pra pagar? Mandam comprovante?",
+    "Como funciona a cobrança do frete?",
+    "Chega quando se eu pedir hoje?",
+    "Tem rastreio?",
+    "E se não chegar?",
   ])("não pede humano: %s", (texto) => {
     expect(preChecagem(texto)).toBeNull();
+  });
+
+  test.each([
+    ["Meu pedido foi pelos correios?", "entrega"],
+    ["Comprei ontem, qual o prazo de entrega?", "entrega"],
+    ["já paguei, cadê o rastreio", "pagamento"],
+    ["Fiz o pedido, posso mudar o endereço?", "entrega"],
+    ["Fiz uma compra e quero devolver", "cancelamento"],
+    ["pedido nº 4567: não recebi ainda", "entrega"],
+    ["#98765 aparece como entregue", "entrega"],
+    ["minha encomenda está atrasada", "entrega"],
+    ["Comprei, vocês mandam comprovante?", "pagamento"],
+  ])("com pedido já feito, pede humano: %s → %s", (texto, motivo) => {
+    expect(preChecagem(texto)).toMatchObject({ motivo, detalhe: expect.stringMatching(/palavra-chave/) });
+  });
+
+  test("reclamação explícita e > 20 cartas continuam indo direto, sem contexto de pedido", () => {
+    expect(preChecagem("que absurdo esse atendimento")?.motivo).toBe("reclamacao");
+    expect(preChecagem("vocês fazem 50 cartas?")?.motivo).toBe("quantidade");
+    expect(preChecagem("quero cancelar")?.motivo).toBe("cancelamento");
   });
 
   test("quantidade de cartas", () => {
@@ -1062,11 +1569,73 @@ describe("classificarEvento e montarTurno", () => {
   });
 });
 
+describe("contexto do Instagram no prompt", () => {
+  const c = contexto(new Date(T0));
+
+  test("direct não recebe foto, não aprova arte, modelo não vê imagem; pedido pelo site e fotos no pós-compra", () => {
+    expect(c).toContain("Aqui NÃO se recebe foto");
+    expect(c).toContain("NÃO se aprova arte");
+    expect(c).toContain("você não vê imagens");
+    expect(c).toContain("O pedido é feito no site eternizacards.com.br");
+    expect(c).toMatch(/depois de pagar, o cliente recebe um link pra mandar as fotos e os nomes/);
+  });
+
+  test("nada de WhatsApp: sem telefone, sem wa.me; pedido existente → humano", () => {
+    expect(c).toMatch(/Nunca mande o cliente pro WhatsApp: sem número de telefone, sem wa\.me/);
+    expect(c).toMatch(/pedido já feito .* → acao "humano"/);
+    expect(temTelefone(c)).toBe(false);
+  });
+
+  test("manda ignorar do manual: 3b (saudação/UTM), coleta de fotos aqui, 48h e consulta por telefone", () => {
+    expect(c).toMatch(/IGNORE[^\n]*seção 3b[^\n]*UTM/);
+    expect(c).toMatch(/IGNORE[^\n]*fotos e nomes "aqui"/);
+    expect(c).toMatch(/IGNORE[^\n]*48 horas úteis/);
+    expect(c).toMatch(/IGNORE[^\n]*consulta de pedido por telefone/);
+  });
+
+  test("pode somar planos até 20 cartas (não diz mais 'nunca some valores')", () => {
+    expect(c).not.toMatch(/nunca some valores/i);
+    expect(c).toContain("Pode somar os planos pra combinações até 20 cartas");
+    expect(c).toContain("Acima de 20 cartas não dê preço");
+    // os exemplos do próprio prompt passam na trava
+    for (const preco of ["R$ 139,80", "R$ 199,80"]) expect(travasDoTexto(`Fica ${preco}`, T0)).toBeNull();
+  });
+
+  test("amostra antes do pagamento: fala em arte e não usa 'prévia'", () => {
+    expect(c).toContain("diga que a arte é feita depois do pagamento");
+    expect(c).toContain("não use a palavra \"prévia\" na resposta");
+    expect(c).not.toMatch(/Nunca mostre, prometa ou mande prévia/);
+  });
+
+  test("humano: não promete aviso ao Vini, só que um humano assume", () => {
+    expect(c).not.toMatch(/o sistema avisa o Vini/);
+    expect(c).toContain("o texto que você escrever NÃO é enviado: um humano assume a conversa");
+  });
+});
+
 // ══════════════════════════════════════════════════════════════════════════
 // Arquivos: manual, vercel.json, migração
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("arquivos", () => {
+  test("manual: sha256 do conteúdo (sem o cabeçalho) bate com o do cabeçalho — pega edição local", () => {
+    const bruto = readFileSync(new URL("../docs/agente-whatsapp-manual.md", import.meta.url), "utf8");
+    const s = separarManual(bruto);
+    expect(s.cabecalho).toBeTruthy();
+    expect(s.commit).toMatch(/^[0-9a-f]{7,40}$/);
+    expect(s.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(sha256(s.conteudo)).toBe(s.sha256);
+    // o cabeçalho é exatamente o que montarManual gera (o --atualizar do script)
+    expect(montarManual(s.conteudo, s.commit)).toBe(bruto);
+    expect(s.conteudo.startsWith("# Manual do agente de atendimento")).toBe(true);
+  });
+
+  test("manual: uma edição de 1 caractere no conteúdo é detectada", () => {
+    const s = separarManual(lerManual());
+    const editado = separarManual(s.cabecalho + s.conteudo.replace("R$ 39,90", "R$ 29,90"));
+    expect(sha256(editado.conteudo)).not.toBe(editado.sha256);
+  });
+
   test("manual copiado do painel, com a origem no cabeçalho e as regras que as travas checam", () => {
     const m = lerManual();
     expect(m).toMatch(/^<!--[\s\S]*eternizacards-painel[\s\S]*dc6e271[\s\S]*-->/);
@@ -1097,7 +1666,43 @@ describe("arquivos", () => {
     expect(sql).toMatch(/mid\s+text not null unique/);
     expect(sql).toMatch(/igsid\s+text not null unique/);
     expect(sql).toContain("check (direcao in ('entrada', 'saida_auto', 'eco_manual'))");
-    expect(sql).toContain("check (tipo in ('resposta', 'humano', 'erro_envio', 'bloqueio'))");
+    expect(sql).toContain("check (tipo in ('resposta', 'humano', 'frase_humano', 'erro_envio', 'bloqueio'))");
+    expect(sql).toContain("check (origem in ('cliente', 'llm', 'comentario', 'vinicius', 'sistema'))");
+    expect(sql).toMatch(/humano_frase_enviada_em\s+timestamptz/);
+  });
+
+  const lerSql = () => readFileSync(new URL("../supabase/migrations/20261116190000_ig_dm.sql", import.meta.url), "utf8");
+
+  test("migração: view ig_dm_pendentes_humano com security_invoker e acesso só da service_role", () => {
+    const sql = lerSql();
+    expect(sql).toMatch(/create or replace view public\.ig_dm_pendentes_humano\s+with \(security_invoker = true\) as/);
+    const view = sql.slice(sql.indexOf("create or replace view"), sql.indexOf("comment on view"));
+    expect(view).toMatch(/where c\.humano and not c\.pausada_manual/);
+    for (const col of ["as motivo", "c.humano_em", "as ultimo_texto_cliente"]) expect(view).toContain(col);
+    expect(sql).toContain("revoke all on table public.ig_dm_pendentes_humano from anon, authenticated;");
+    expect(sql).toContain("grant select on table public.ig_dm_pendentes_humano to service_role;");
+  });
+
+  test("migração: ig_dm_expurgar(dias default 180), security definer, search_path fixo, só service_role; pg_cron comentado", () => {
+    const sql = lerSql();
+    expect(sql).toMatch(/create or replace function public\.ig_dm_expurgar\(dias integer default 180\)/);
+    const fn = sql.slice(sql.indexOf("create or replace function"), sql.indexOf("$$;") + 3);
+    expect(fn).toMatch(/security definer/);
+    expect(fn).toMatch(/set search_path = ''/);
+    for (const t of ["ig_dm_mensagens", "ig_dm_log", "ig_dm_conversas"]) expect(fn).toMatch(new RegExp(`delete from public\\.${t}`));
+    expect(sql).toContain("revoke all on function public.ig_dm_expurgar(integer) from public, anon, authenticated;");
+    expect(sql).toContain("grant execute on function public.ig_dm_expurgar(integer) to service_role;");
+    // o agendamento existe só como comentário
+    const linhasCron = sql.split("\n").filter((l) => l.includes("cron.schedule"));
+    expect(linhasCron.length).toBeGreaterThan(0);
+    for (const l of linhasCron) expect(l.trim().startsWith("--")).toBe(true);
+    expect(sql).not.toMatch(/create extension/i);
+  });
+
+  test("package.json: script checar-manual", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    expect(pkg.scripts["checar-manual"]).toBe("node scripts/checar-manual.mjs");
+    expect(Object.keys(pkg.dependencies || {})).toEqual([]);
   });
 
   test("credenciais do banco: só https e as duas envs", () => {
@@ -1109,5 +1714,110 @@ describe("arquivos", () => {
 
   test("só a eterniza atende DM (contas.js inalterado)", () => {
     expect(CONTAS.map((c) => c.slug)).toEqual(["watanabe", "eterniza"]);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// scripts/checar-manual.mjs (sem rede: busca e escrita injetadas)
+// ══════════════════════════════════════════════════════════════════════════
+
+describe("checar-manual", () => {
+  const COPIA = readFileSync(new URL("../docs/agente-whatsapp-manual.md", import.meta.url), "utf8");
+  const { conteudo } = separarManual(COPIA);
+  const COMMIT = { sha: "abcdef1234567890abcdef1234567890abcdef12", data: "2026-11-20T10:00:00Z", mensagem: "docs: manual novo" };
+
+  function rodarScript(args, remoto, copia = COPIA) {
+    const saida = [];
+    const gravados = [];
+    const codigo = checarManual({
+      args,
+      buscar: async () => remoto,
+      caminho: "/copia.md",
+      ler: () => copia,
+      gravar: (p, t) => gravados.push([p, t]),
+      log: (s) => saida.push(s),
+      erro: (s) => saida.push(s),
+    });
+    return codigo.then((c) => ({ codigo: c, saida: saida.join("\n"), gravados }));
+  }
+
+  test("em dia: código 0, não grava nada", async () => {
+    const r = await rodarScript([], { conteudo, commit: COMMIT });
+    expect(r.codigo).toBe(0);
+    expect(r.saida).toMatch(/em dia/);
+    expect(r.gravados).toEqual([]);
+  });
+
+  test("diverge: código 1 e mostra o commit mais recente do arquivo no painel", async () => {
+    const r = await rodarScript([], { conteudo: conteudo + "\nlinha nova\n", commit: COMMIT });
+    expect(r.codigo).toBe(1);
+    expect(r.saida).toMatch(/DIVERGE/);
+    expect(r.saida).toContain("abcdef1 (2026-11-20T10:00:00Z) docs: manual novo");
+    expect(r.saida).toContain("--atualizar");
+    expect(r.gravados).toEqual([]);
+  });
+
+  test("--atualizar: regrava a cópia com o conteúdo do painel e o cabeçalho novo (commit + sha256)", async () => {
+    const novo = conteudo + "\nlinha nova\n";
+    const r = await rodarScript(["--atualizar"], { conteudo: novo, commit: COMMIT });
+    expect(r.codigo).toBe(0);
+    expect(r.gravados).toHaveLength(1);
+    const [caminho, texto] = r.gravados[0];
+    expect(caminho).toBe("/copia.md");
+    const s = separarManual(texto);
+    expect(s).toMatchObject({ conteudo: novo, commit: "abcdef1", sha256: sha256(novo) });
+  });
+
+  test("cópia editada à mão: avisa que o sha256 não bate e diverge (código 1)", async () => {
+    const editada = COPIA.replace("R$ 39,90", "R$ 29,90");
+    const r = await rodarScript([], { conteudo, commit: COMMIT }, editada);
+    expect(r.saida).toMatch(/editada à mão/);
+    expect(r.codigo).toBe(1);
+  });
+
+  test("erro na busca: código 2", async () => {
+    const r = await checarManual({ args: [], buscar: async () => { throw new Error("gh falhou"); }, ler: () => COPIA, log: () => {}, erro: () => {} });
+    expect(r).toBe(2);
+  });
+
+  test("buscarDoPainel: usa `gh api` (sem shell) no repo e caminho certos", async () => {
+    const chamadas = [];
+    const exec = (cmd, args) => {
+      chamadas.push([cmd, ...args]);
+      if (args[1].includes("/contents/")) return JSON.stringify({ content: Buffer.from("# oi\n").toString("base64").replace(/(.{4})/g, "$1\n"), encoding: "base64" });
+      return JSON.stringify([{ sha: COMMIT.sha, commit: { committer: { date: COMMIT.data }, message: "docs: manual novo\n\ncorpo" } }]);
+    };
+    const fetchFalso = vi.fn();
+    const r = await buscarDoPainel({ env: {}, exec, fetch: fetchFalso });
+    expect(r).toEqual({ conteudo: "# oi\n", commit: COMMIT });
+    expect(chamadas[0]).toEqual(["gh", "api", `repos/${REPO_PAINEL}/contents/${CAMINHO_MANUAL_PAINEL}?ref=main`]);
+    expect(chamadas[1][2]).toMatch(new RegExp(`^repos/${REPO_PAINEL}/commits\\?path=docs%2Fagente-whatsapp-manual\\.md&sha=main&per_page=1$`));
+    expect(fetchFalso).not.toHaveBeenCalled();
+  });
+
+  test("buscarDoPainel: sem gh e sem GITHUB_TOKEN → erro claro, sem rede", async () => {
+    const exec = () => { const e = new Error("spawn gh ENOENT"); e.code = "ENOENT"; throw e; };
+    const fetchFalso = vi.fn();
+    await expect(buscarDoPainel({ env: {}, exec, fetch: fetchFalso })).rejects.toThrow(/gh não instalado.*sem GITHUB_TOKEN/);
+    expect(fetchFalso).not.toHaveBeenCalled();
+  });
+
+  test("buscarDoPainel: sem gh, com GITHUB_TOKEN → API do GitHub; erro não vaza o token", async () => {
+    const GH_TOKEN = "ghp_token_falso_so_para_teste_1234567890";
+    const exec = () => { const e = new Error("spawn gh ENOENT"); e.code = "ENOENT"; throw e; };
+    const ok = vi.fn(async (url) =>
+      url.includes("/contents/")
+        ? json(200, { content: Buffer.from("# oi\n").toString("base64"), encoding: "base64" })
+        : json(200, [{ sha: COMMIT.sha, commit: { author: { date: COMMIT.data }, message: COMMIT.mensagem } }])
+    );
+    const r = await buscarDoPainel({ env: { GITHUB_TOKEN: GH_TOKEN }, exec, fetch: ok });
+    expect(r.conteudo).toBe("# oi\n");
+    expect(ok.mock.calls[0][0]).toBe(`https://api.github.com/repos/${REPO_PAINEL}/contents/${CAMINHO_MANUAL_PAINEL}?ref=main`);
+    expect(ok.mock.calls[0][1].headers.Authorization).toBe(`Bearer ${GH_TOKEN}`);
+
+    const recusa = vi.fn(async () => json(401, { message: `Bad credentials ${GH_TOKEN}` }));
+    const erro = await buscarDoPainel({ env: { GITHUB_TOKEN: GH_TOKEN }, exec, fetch: recusa }).catch((e) => e);
+    expect(erro.message).toMatch(/GitHub 401/);
+    expect(erro.message).not.toContain(GH_TOKEN);
   });
 });

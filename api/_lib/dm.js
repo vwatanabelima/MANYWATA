@@ -8,7 +8,10 @@
 //   2. Com DM_AUTO_RESPOSTA=1 (padrão: desligado, só grava), responde na hora
 //      com o LLM (dm-llm.js), o manual como system prompt e as travas de
 //      dm-regras.js. Na dúvida passa pra humano: marca a conversa
-//      (humano=true) e daí em diante a automação não responde mais ali.
+//      (humano=true), manda UMA frase curta pro cliente (se a janela de 24h
+//      estiver aberta), avisa o Vinicius (dm-aviso.js, opcional) e daí em
+//      diante a automação não responde mais ali. Falha do LLM e falha de
+//      envio pela Meta também passam pra humano.
 //   3. Eco (is_echo) que não é envio nosso = o Vinicius respondeu pelo app:
 //      a conversa fica pausada (pausada_manual) e a automação para ali.
 //
@@ -22,10 +25,12 @@ import { randomUUID } from "node:crypto";
 import { sanitizar } from "./seguranca.js";
 import { criarBanco, lerCredenciaisBanco } from "./dm-banco.js";
 import { chamarModelo, lerManual, modeloAgente } from "./dm-llm.js";
+import { avisarHumano } from "./dm-aviso.js";
 import {
   ECO_PROPRIO_MS,
   classificarEvento,
   contexto as blocoContexto,
+  fraseHumano,
   janelaAberta,
   JANELA_24H_MS,
   lerRespostaModelo,
@@ -54,6 +59,10 @@ const ORCAMENTO_LLM_MS = 25_000;
 const MAX_VOLTAS = 3;
 const MAX_TENTATIVAS = 2;
 const HISTORICO = 30;
+// Envio da resposta do LLM e da frase de humano (a frase é tentativa única,
+// com timeout menor: no pior caso LLM 25s + envio 15s + frase 8s cabe nos 60s).
+const ENVIO_TIMEOUT_MS = 15_000;
+const FRASE_TIMEOUT_MS = 8_000;
 
 export const autoRespostaLigada = (env = process.env) => String(env.DM_AUTO_RESPOSTA ?? "").trim() === "1";
 
@@ -89,7 +98,7 @@ export async function processarMessaging(eventos, { conta, token }, opcoes = {})
     now: opcoes.now || Date.now,
     lerManual: opcoes.lerManual || lerManual,
     banco: opcoes.banco || criarBanco(cred, fetchFn),
-    segredos: [token, cred?.chave, env.OPENROUTER_API_KEY].filter(Boolean),
+    segredos: [token, cred?.chave, env.OPENROUTER_API_KEY, env.TELEGRAM_BOT_TOKEN].filter(Boolean),
   };
   ctx.inicio = ctx.now();
 
@@ -290,6 +299,7 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
     const cobrir = () => midsTurno.forEach((mid) => estado.cobertas.add(mid));
     const agora = ctx.now();
     const base = { igsid, mid_entrada: midEntrada };
+    const textoTurno = montarTurno(turno);
 
     // janela de 24h, pela última entrada do cliente gravada no banco
     const ultimaEntrada = Math.max(...msgs.filter((m) => m.direcao === "entrada").map((m) => Date.parse(m.enviada_em)));
@@ -298,19 +308,19 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
       await registrar(ctx, { ...base, tipo: "bloqueio", motivo: "fora_da_janela", detalhe: "última mensagem do cliente tem 24h ou mais" });
       return;
     }
+    const humano = (campos) => passarParaHumano(ctx, campos, { ultimaEntradaMs: ultimaEntrada, ultimoTexto: textoTurno });
 
     const max = maxPorJanela(ctx.env);
     if (limiteAtingido(conversa, max, agora)) {
       cobrir();
-      await passarParaHumano(ctx, { ...base, motivo: "limite_respostas", detalhe: `${conversa.auto_respostas_janela} respostas automáticas em 24h (máximo ${max})` });
+      await humano({ ...base, motivo: "limite_respostas", detalhe: `${conversa.auto_respostas_janela} respostas automáticas em 24h (máximo ${max})` });
       return;
     }
 
-    const textoTurno = montarTurno(turno);
     const pre = preChecagem(textoTurno);
     if (pre) {
       cobrir();
-      await passarParaHumano(ctx, { ...base, ...pre });
+      await humano({ ...base, ...pre });
       return;
     }
 
@@ -333,10 +343,11 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
         { env: ctx.env, fetch: ctx.fetch }
       );
     } catch (err) {
+      // rede, timeout, 5xx, chave recusada: o cliente não fica sem resposta
       cobrir();
       const detalhe = sanitizar(err?.message || err, ctx.segredos).slice(0, 500);
       console.error(`[${ctx.conta.slug}] dm ${midEntrada}: LLM falhou: ${detalhe}`);
-      await registrar(ctx, { ...base, tipo: "bloqueio", motivo: "erro_llm", detalhe, modelo: modeloAgente(ctx.env) });
+      await humano({ ...base, motivo: "erro_llm", detalhe, modelo: modeloAgente(ctx.env) });
       return;
     }
     const llm = { modelo: r.modelo, custo_usd: r.custoUsd };
@@ -344,25 +355,25 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
     const lida = lerRespostaModelo(r.conteudo);
     if (!lida.ok) {
       cobrir();
-      await passarParaHumano(ctx, { ...base, ...llm, motivo: "llm_invalido", detalhe: lida.erro, texto: String(r.conteudo ?? "").slice(0, 1000) });
+      await humano({ ...base, ...llm, motivo: "llm_invalido", detalhe: lida.erro, texto: String(r.conteudo ?? "").slice(0, 1000) });
       return;
     }
     const extra = { ...base, ...llm, confianca: lida.confianca, texto: lida.texto || null };
     if (lida.acao === "humano") {
       cobrir();
-      await passarParaHumano(ctx, { ...extra, motivo: `modelo:${lida.motivo || "OUTRO"}`, detalhe: "o modelo pediu humano" });
+      await humano({ ...extra, motivo: `modelo:${lida.motivo || "OUTRO"}`, detalhe: "o modelo pediu humano" });
       return;
     }
     const minimo = confiancaMinima(ctx.env);
     if (lida.confianca < minimo) {
       cobrir();
-      await passarParaHumano(ctx, { ...extra, motivo: "confianca_baixa", detalhe: `confiança ${lida.confianca} < ${minimo}` });
+      await humano({ ...extra, motivo: "confianca_baixa", detalhe: `confiança ${lida.confianca} < ${minimo}` });
       return;
     }
     const trava = travasDoTexto(lida.texto, ctx.now());
     if (trava) {
       cobrir();
-      await passarParaHumano(ctx, { ...extra, ...trava });
+      await humano({ ...extra, ...trava });
       return;
     }
 
@@ -386,11 +397,13 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
     const enviadoEm = new Date(ctx.now()).toISOString();
     // marca ANTES do POST: o eco pode chegar antes de gravarmos o mid
     await banco.atualizarConversa(igsid, { ultima_auto_texto: lida.texto, ultima_auto_em: enviadoEm });
-    const envio = await enviarDm(ctx, igsid, lida.texto);
+    const envio = await enviarDm(ctx, igsid, lida.texto, ENVIO_TIMEOUT_MS);
     cobrir();
     if (!envio.ok) {
       console.error(`[${ctx.conta.slug}] dm ${midEntrada}: envio falhou: ${envio.erro}`);
       await registrar(ctx, { ...extra, tipo: "erro_envio", motivo: "envio_falhou", detalhe: envio.erro });
+      // a frase de humano também é tentativa única: se falhar, só loga
+      await humano({ ...extra, motivo: "envio_falhou", detalhe: envio.erro });
       return;
     }
     await banco.gravarMensagem({
@@ -411,21 +424,88 @@ async function responderComTrava(ctx, igsid, conversaTravada, estado) {
   }
 }
 
-async function passarParaHumano(ctx, { motivo, detalhe, ...resto }) {
+// Passa a conversa pra humano:
+//   1. marca (humano=true, motivo, hora): a automação para ali e a conversa
+//      aparece na view ig_dm_pendentes_humano;
+//   2. log 'humano';
+//   3. em paralelo: a frase pro cliente (no máximo uma vez por conversa
+//      marcada, só com a janela de 24h aberta) e o aviso ao Vinicius
+//      (dm-aviso.js; sem env de canal, só console).
+// Nada aqui lança pro chamador além do erro de banco do passo 1, que também
+// é pego: o aviso sai mesmo se o banco falhar.
+async function passarParaHumano(ctx, { motivo, detalhe, ...resto }, { ultimaEntradaMs, ultimoTexto } = {}) {
+  const { igsid } = resto;
   const agoraIso = new Date(ctx.now()).toISOString();
-  await ctx.banco.atualizarConversa(resto.igsid, { humano: true, humano_motivo: motivo, humano_em: agoraIso, atualizado_em: agoraIso });
-  console.log(`[${ctx.conta.slug}] dm ${resto.igsid}: passou pra humano (${motivo})`);
+  let marcada = false;
+  try {
+    await ctx.banco.atualizarConversa(igsid, { humano: true, humano_motivo: motivo, humano_em: agoraIso, atualizado_em: agoraIso });
+    marcada = true;
+    console.log(`[${ctx.conta.slug}] dm ${igsid}: passou pra humano (${motivo})`);
+  } catch (err) {
+    console.error(`[${ctx.conta.slug}] dm ${igsid}: falhou marcar humano (${motivo}): ${sanitizar(err?.message || err, ctx.segredos)}`);
+  }
   await registrar(ctx, { ...resto, tipo: "humano", motivo, detalhe });
+  await Promise.all([
+    marcada ? fraseAoCliente(ctx, igsid, ultimaEntradaMs, resto.mid_entrada) : null,
+    avisarHumano(
+      { igsid, motivo, detalhe: detalhe == null ? null : sanitizar(detalhe, ctx.segredos), ultimoTexto },
+      { env: ctx.env, fetch: ctx.fetch, rotulo: ctx.conta.slug }
+    ),
+  ]);
+}
+
+// Frase curta pro cliente ao passar pra humano (fraseHumano: DM_FRASE_HUMANO
+// ou a padrão). Atômica: o PATCH só pega quem achar humano_frase_enviada_em
+// vazio (e a conversa sem pausa), então sai no máximo uma vez por conversa
+// marcada, mesmo com execuções simultâneas. Tentativa única: se o envio
+// falhar, fica o log 'erro_envio' e não tenta de novo.
+async function fraseAoCliente(ctx, igsid, ultimaEntradaMs, midEntrada) {
+  const slug = ctx.conta.slug;
+  try {
+    if (!janelaAberta(ultimaEntradaMs, ctx.now())) {
+      console.log(`[${slug}] dm ${igsid}: janela de 24h fechada — sem frase de humano`);
+      return;
+    }
+    const { texto, recusada } = fraseHumano(ctx.env, ctx.now());
+    if (recusada) console.warn(`[${slug}] dm: DM_FRASE_HUMANO recusada pelas travas (${recusada}) — usando a frase padrão`);
+    const agoraIso = new Date(ctx.now()).toISOString();
+    // marca ANTES do POST (como a resposta do LLM): o eco pode chegar antes
+    // de gravarmos o mid e não pode pausar a conversa
+    const linhas = await ctx.banco.atualizarConversa(
+      igsid,
+      { humano_frase_enviada_em: agoraIso, ultima_auto_texto: texto, ultima_auto_em: agoraIso },
+      { humano: "is.true", pausada_manual: "is.false", humano_frase_enviada_em: "is.null" }
+    );
+    if (!linhas[0]) {
+      console.log(`[${slug}] dm ${igsid}: frase de humano já enviada (ou conversa pausada) — não manda de novo`);
+      return;
+    }
+    const envio = await enviarDm(ctx, igsid, texto, FRASE_TIMEOUT_MS);
+    if (!envio.ok) {
+      console.error(`[${slug}] dm ${igsid}: frase de humano não saiu: ${envio.erro}`);
+      await registrar(ctx, { tipo: "erro_envio", igsid, mid_entrada: midEntrada, texto, motivo: "frase_humano", detalhe: envio.erro });
+      return;
+    }
+    await ctx.banco.gravarMensagem({
+      mid: envio.mid, igsid, texto, tipo: "texto",
+      direcao: "saida_auto", origem: "sistema", enviada_em: agoraIso,
+    });
+    await ctx.banco.atualizarConversa(igsid, { ultima_saida_em: agoraIso, atualizado_em: agoraIso });
+    console.log(`[${slug}] dm ${igsid}: frase de humano enviada`);
+    await registrar(ctx, { tipo: "frase_humano", igsid, mid_entrada: midEntrada, mid_saida: envio.mid, texto });
+  } catch (err) {
+    console.error(`[${slug}] dm ${igsid}: frase de humano falhou: ${sanitizar(err?.message || err, ctx.segredos)}`);
+  }
 }
 
 // POST /me/messages com recipient.id = IGSID. Devolve { ok, mid } ou { ok:false, erro } sanitizado.
-async function enviarDm(ctx, igsid, texto) {
+async function enviarDm(ctx, igsid, texto, timeoutMs = ENVIO_TIMEOUT_MS) {
   try {
     const r = await ctx.fetch(`${GRAPH}/me/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${ctx.token}` },
       body: JSON.stringify({ recipient: { id: igsid }, message: { text: texto } }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) {
