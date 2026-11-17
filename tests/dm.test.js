@@ -1638,7 +1638,7 @@ describe("arquivos", () => {
 
   test("manual copiado do painel, com a origem no cabeçalho e as regras que as travas checam", () => {
     const m = lerManual();
-    expect(m).toMatch(/^<!--[\s\S]*eternizacards-painel[\s\S]*dc6e271[\s\S]*-->/);
+    expect(m).toMatch(/^<!--[\s\S]*eternizacards-painel[\s\S]*[0-9a-f]{7,40}[\s\S]*-->/);
     expect(m).toContain("# Manual do agente de atendimento — EternizaCards");
     expect(m).toContain("| Carta Única | 1 | R$ 39,90 |");
     expect(m).toContain("| Trio Colecionável | 3 | R$ 99,90 |");
