@@ -29,7 +29,7 @@ import {
 } from "../scripts/_storage.mjs";
 
 const SEGREDO = "segredo-de-teste-com-bem-mais-de-32-caracteres";
-const TOKEN = "IGAAtokenSuperSecretoDaEterniza0123456789";
+const TOKEN = "token-falso-eterniza-midia-so-para-teste-0123456789";
 const USER = "17841438494434121"; // @eternizacards
 const ENV = { PUBLICAR_SECRET: SEGREDO, IG_ACCESS_TOKEN_ETERNIZA: TOKEN };
 const T0 = Date.parse("2026-11-15T12:00:00.000Z");

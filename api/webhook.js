@@ -1,6 +1,9 @@
 import crypto from "node:crypto";
 // contas atendidas + suas regras palavra-gatilho → ação (edite contas.js)
 import { contaPorUserId, regraQueCasa, tokenDaConta } from "./contas.js";
+// DMs (entry.messaging) da eterniza: grava e, se ligado, responde (api/_lib/dm.js)
+import { atendeDm, processarMessaging } from "./_lib/dm.js";
+import { sanitizar } from "./_lib/seguranca.js";
 
 // ── Config via env vars (set no painel da Vercel) ─────────────────────────
 // VERIFY_TOKEN e APP_SECRET são do APP, valem pra todas as contas.
@@ -69,7 +72,9 @@ function verifySignature(raw, header) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-async function processEvents(payload) {
+// opcoes só vale pras DMs (env/fetch/now injetáveis nos testes). O
+// comentário→DM usa o fetch global, do mesmo jeito de sempre.
+export async function processEvents(payload, opcoes = {}) {
   if (payload.object !== "instagram") return;
 
   for (const entry of payload.entry || []) {
@@ -103,6 +108,17 @@ async function processEvents(payload) {
       console.log(`[${conta.slug}] comentário ${commentId} casou regra "${rule.keyword}"`);
       await sendPrivateReply(commentId, rule.dm, token);
       if (rule.publicReply) await replyToComment(commentId, rule.publicReply, token);
+    }
+
+    // DMs: só a conta eterniza (as outras ignoram messaging). Vem DEPOIS do
+    // comentário→DM e num try próprio: banco, LLM ou Meta fora do ar aqui não
+    // muda nada no comentário→DM, e o webhook responde 200 do mesmo jeito.
+    if (atendeDm(conta) && Array.isArray(entry.messaging) && entry.messaging.length) {
+      try {
+        await processarMessaging(entry.messaging, { conta, token }, opcoes);
+      } catch (err) {
+        console.error(`[${conta.slug}] dm: ${sanitizar(err?.message || err, [token])}`);
+      }
     }
   }
 }

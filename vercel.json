@@ -1,6 +1,7 @@
 {
   "functions": {
     "api/midia/*.js": { "maxDuration": 300 },
-    "api/carrossel/*.js": { "maxDuration": 300 }
+    "api/carrossel/*.js": { "maxDuration": 300 },
+    "api/webhook.js": { "maxDuration": 60, "includeFiles": "docs/agente-whatsapp-manual.md" }
   }
 }
