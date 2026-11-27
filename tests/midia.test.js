@@ -2,7 +2,7 @@
 // fetch falso: nenhum teste chama o Instagram de verdade.
 
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rotaPublicar } from "../api/_lib/rotas-midia.js";
@@ -11,6 +11,7 @@ import { TIPOS, validarLegenda, criarPublicador, emParalelo } from "../api/_lib/
 import {
   MAX_DURATION_S,
   ORCAMENTO_CONTAINERS_MS,
+  ORCAMENTO_REELS_MS,
   STATUS_ESPERA_MINIMA_MS,
   CLI_TIMEOUT_ROTA_MS,
 } from "../api/_lib/tempos.js";
@@ -281,19 +282,20 @@ describe("validação (400, zero fetch)", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test.each(["REELS", "reels"])("tipo %s → 501 e zero fetch", async (tipo) => {
+  test.each(["REELS", "reels"])("tipo %s com itens de carrossel (JPEGs) → 400 da validação do Reels e zero fetch", async (tipo) => {
     const { fetch } = meta();
     const res = await publicar({ body: corpo({ tipo }), fetch });
-    expect(res.statusCode).toBe(501);
-    expect(res.body.erro).toMatch(/não implementado/);
-    expect(res.body.erro).toMatch(/Hoje: CAROUSEL, STORIES/);
+    expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(/Reels leva exatamente 1 vídeo \(veio 3\)/);
+    expect(res.body.publicado).toBe(false);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("registro de tipos: CAROUSEL e STORIES implementados, REELS não", () => {
+  test("registro de tipos: CAROUSEL, REELS e STORIES implementados", () => {
     expect(Object.keys(TIPOS)).toEqual(["CAROUSEL", "REELS", "STORIES"]);
     expect(TIPOS.CAROUSEL.implementado).toBe(true);
-    expect(TIPOS.REELS.implementado).toBe(false);
+    expect(TIPOS.REELS.implementado).toBe(true);
+    expect(TIPOS.REELS.permalinkOpcional).toBeUndefined();
     expect(TIPOS.STORIES.implementado).toBe(true);
   });
 });
@@ -612,10 +614,11 @@ describe("STORIES", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("REELS continua 501", async () => {
+  test("tipo REELS com URL JPEG → 400 da validação do Reels (não é vídeo), zero fetch", async () => {
     const { fetch } = meta();
     const res = await publicar({ body: corpoStory({ tipo: "REELS" }), fetch });
-    expect(res.statusCode).toBe(501);
+    expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(/Reels precisa de vídeo MP4\/MOV \(veio \.jpg\)/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -689,6 +692,222 @@ describe("STORIES", () => {
     const res = await publicar({ fetch });
     expect(res.body.aviso).toMatch(/NÃO publique de novo/);
     warn.mockRestore();
+  });
+});
+
+// ── REELS (1 vídeo, mesma rota) ───────────────────────────────────────────
+
+describe("REELS", () => {
+  const VIDEO = "https://cdn.exemplo.com/reels/drop-natal.mp4";
+  const CAPA = "https://cdn.exemplo.com/reels/capa.jpg";
+  const corpoReels = (extra = {}) => ({
+    conta: "eterniza",
+    tipo: "REELS",
+    itens: [{ video_url: VIDEO }],
+    legenda: LEGENDA,
+    confirmar: true,
+    ...extra,
+  });
+  const container = (chamadas) => chamadas.find((c) => c.metodo === "POST" && c.caminho === `${USER}/media`);
+  let warn;
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  test("feliz: limite → container REELS → FINISHED → media_publish → permalink", async () => {
+    const { fetch, chamadas } = meta({ quota: 3, permalink: "https://www.instagram.com/reel/XYZ/" });
+    const res = await publicar({ body: corpoReels(), fetch });
+
+    expect(res.statusCode).toBe(200);
+    expect(resumo(chamadas)).toEqual([
+      `GET ${USER}/content_publishing_limit`,
+      `POST ${USER}/media`,
+      "GET 1000",
+      `POST ${USER}/media_publish`,
+      "GET 9001",
+    ]);
+    // params EXATOS: sem cover_url, sem share_to_feed, sem image_url
+    expect(chamadas[1].params).toEqual({ media_type: "REELS", video_url: VIDEO, caption: LEGENDA });
+    expect(chamadas[3].params).toEqual({ creation_id: "1000" });
+    for (const c of chamadas) {
+      expect(c.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+      expect(c.url).not.toContain(TOKEN);
+      expect(JSON.stringify(c.params ?? {})).not.toContain(TOKEN);
+    }
+    expect(res.body).toEqual({
+      mediaId: "9001",
+      permalink: "https://www.instagram.com/reel/XYZ/",
+      username: "eternizacards",
+      quota: { usado: 4, total: 50 },
+      conta: "eterniza",
+      tipo: "REELS",
+    });
+    expect(JSON.stringify(res.body)).not.toContain(TOKEN);
+  });
+
+  test.each([
+    ["video_url", { video_url: VIDEO }, VIDEO],
+    ["video_url sem extensão", { video_url: "https://cdn.exemplo.com/v/abc123" }, "https://cdn.exemplo.com/v/abc123"],
+    ["url .mp4", { url: "https://cdn.exemplo.com/x.mp4" }, "https://cdn.exemplo.com/x.mp4"],
+    ["url .MOV", { url: "https://cdn.exemplo.com/x.MOV" }, "https://cdn.exemplo.com/x.MOV"],
+    ["url .m4v", { url: "https://cdn.exemplo.com/x.m4v" }, "https://cdn.exemplo.com/x.m4v"],
+  ])("aceita itens: [{ %s }]", async (_n, item, esperado) => {
+    const { fetch, chamadas } = meta();
+    const res = await publicar({ body: corpoReels({ itens: [item] }), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(container(chamadas).params.video_url).toBe(esperado);
+  });
+
+  test.each([["ausente", undefined], ["null", null], ["vazia", ""], ["só espaços", "  \n "]])(
+    "legenda %s → sem caption",
+    async (_n, legenda) => {
+      const { fetch, chamadas } = meta();
+      const res = await publicar({ body: corpoReels({ legenda }), fetch });
+      expect(res.statusCode).toBe(200);
+      expect(container(chamadas).params).toEqual({ media_type: "REELS", video_url: VIDEO });
+    }
+  );
+
+  test("cover_url e share_to_feed entram nos params só quando enviados", async () => {
+    const a = meta();
+    await publicar({ body: corpoReels({ cover_url: CAPA, share_to_feed: true }), fetch: a.fetch });
+    expect(container(a.chamadas).params).toEqual({ media_type: "REELS", video_url: VIDEO, caption: LEGENDA, cover_url: CAPA, share_to_feed: true });
+
+    const b = meta();
+    await publicar({ body: corpoReels({ share_to_feed: false }), fetch: b.fetch });
+    expect(container(b.chamadas).params).toEqual({ media_type: "REELS", video_url: VIDEO, caption: LEGENDA, share_to_feed: false });
+
+    const c = meta();
+    await publicar({ body: corpoReels({ cover_url: CAPA }), fetch: c.fetch });
+    expect(container(c.chamadas).params).toEqual({ media_type: "REELS", video_url: VIDEO, caption: LEGENDA, cover_url: CAPA });
+  });
+
+  test.each([
+    ["0 itens", { itens: [] }, /exatamente 1 vídeo \(veio 0\)/],
+    ["2 itens", { itens: [{ video_url: VIDEO }, { video_url: VIDEO }] }, /exatamente 1 vídeo \(veio 2\)/],
+    ["itens não é lista", { itens: VIDEO }, /lista/],
+    ["url JPEG", { itens: [{ url: "https://cdn.exemplo.com/x.jpg" }] }, /Reels precisa de vídeo MP4\/MOV \(veio \.jpg\)/],
+    ["video_url JPEG", { itens: [{ video_url: "https://cdn.exemplo.com/x.jpeg" }] }, /video_url: Reels precisa de vídeo/],
+    ["url sem extensão", { itens: [{ url: "https://cdn.exemplo.com/v/abc" }] }, /URL sem extensão; use video_url/],
+    ["http", { itens: [{ video_url: "http://cdn.exemplo.com/x.mp4" }] }, /só https/],
+    ["http em url", { itens: [{ url: "http://cdn.exemplo.com/x.mp4" }] }, /só https/],
+    ["IP privado", { itens: [{ video_url: "https://192.168.0.10/x.mp4" }] }, /não é público/],
+    ["sem url", { itens: [{}] }, /falta a URL do vídeo/],
+    ["item null", { itens: [null] }, /falta a URL do vídeo/],
+    ["legenda longa", { legenda: "a".repeat(2201) }, /2201 caracteres/],
+    ["cover_url png", { cover_url: "https://cdn.exemplo.com/c.png" }, /cover_url: o Instagram só aceita JPEG/],
+    ["cover_url http", { cover_url: "http://cdn.exemplo.com/c.jpg" }, /cover_url: só https/],
+    ["share_to_feed 'true'", { share_to_feed: "true" }, /share_to_feed precisa ser booleano/],
+    ["share_to_feed 1", { share_to_feed: 1 }, /share_to_feed precisa ser booleano/],
+    ["share_to_feed null", { share_to_feed: null }, /share_to_feed precisa ser booleano/],
+  ])("%s → 400 e zero fetch", async (_n, extra, msg) => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoReels(extra), fetch });
+    expect(res.statusCode).toBe(400);
+    expect(res.body.erro).toMatch(msg);
+    expect(res.body.publicado).toBe(false);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("status ERROR → 502 com dica de vídeo, sem media_publish, publicado: false", async () => {
+    const { fetch, chamadas } = meta({ status: () => "ERROR" });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body.publicado).toBe(false);
+    expect(res.body.erro).toMatch(/ERROR/);
+    expect(res.body.erro).toMatch(/limites do Reels/);
+    expect(res.body.erro).not.toMatch(/é um JPEG/);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("status EXPIRED → 410 sem media_publish, publicado: false", async () => {
+    const { fetch, chamadas } = meta({ status: () => "EXPIRED" });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(410);
+    expect(res.body.publicado).toBe(false);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("não fica FINISHED a tempo → 504 sem media_publish", async () => {
+    const { fetch, chamadas } = meta({ status: () => "IN_PROGRESS" });
+    const res = await publicar({ body: corpoReels(), fetch, orcamentoMs: 10_000 });
+    expect(res.statusCode).toBe(504);
+    expect(res.body.publicado).toBe(false);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("orçamento padrão do Reels é ORCAMENTO_REELS_MS (270s), maior que o do carrossel", async () => {
+    const rel = relogio();
+    const { fetch, chamadas } = meta({ status: () => "IN_PROGRESS" });
+    const res = await publicar({ body: corpoReels(), fetch, ...rel });
+    expect(res.statusCode).toBe(504);
+    expect(res.body.erro).toMatch(/não ficou pronto em 270s \(último status: IN_PROGRESS\)/);
+    expect(rel.t - T0).toBe(ORCAMENTO_REELS_MS);
+    expect(publicou(chamadas)).toBe(false);
+  });
+
+  test("container IN_PROGRESS que termina depois → publica", async () => {
+    let n = 0;
+    const { fetch, chamadas } = meta({ status: () => (++n < 4 ? "IN_PROGRESS" : "FINISHED") });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(publicou(chamadas)).toBe(true);
+  });
+
+  test("cota cheia → 429 sem container", async () => {
+    const { fetch, chamadas } = meta({ quota: 50, total: 50 });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(429);
+    expect(res.body.publicado).toBe(false);
+    expect(criouContainer(chamadas)).toBe(false);
+  });
+
+  test("tipo em minúsculas funciona", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoReels({ tipo: "reels" }), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.tipo).toBe("REELS");
+  });
+
+  test("Graph sem permalink depois de publicar → 200 com aviso (Reels não é permalinkOpcional)", async () => {
+    const { fetch } = meta({ permalink: null });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.mediaId).toBe("9001");
+    expect(res.body.permalink).toBeNull();
+    expect(res.body.aviso).toMatch(/NÃO publique de novo/);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  test("GET do permalink falha depois de publicar → 200 com aviso", async () => {
+    const { fetch } = meta({ falhar: { "GET 9001?permalink": "indisponível" } });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.aviso).toMatch(/não deu pra buscar o permalink[\s\S]*NÃO publique de novo/);
+  });
+
+  test("media_publish recusado → 502 sem o campo publicado (indefinido)", async () => {
+    const { fetch } = meta({ falhar: { [`POST ${USER}/media_publish`]: "Fatal" } });
+    const res = await publicar({ body: corpoReels(), fetch });
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toHaveProperty("publicado");
+  });
+
+  test("sem confirmar: true → 400 e zero fetch", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoReels({ confirmar: "true" }), fetch });
+    expect(res.statusCode).toBe(400);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("story de vídeo continua 501", async () => {
+    const { fetch } = meta();
+    const res = await publicar({ body: corpoReels({ tipo: "STORIES", legenda: undefined }), fetch });
+    expect(res.statusCode).toBe(501);
+    expect(res.body.erro).toMatch(/story de vídeo ainda não implementado/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -887,6 +1106,13 @@ describe("tempos", () => {
   test("orçamento + duas esperas mínimas + 30s de folga cabem no maxDuration; CLI espera mais que a função", () => {
     expect(ORCAMENTO_CONTAINERS_MS + 2 * STATUS_ESPERA_MINIMA_MS + 30_000).toBeLessThanOrEqual(MAX_DURATION_S * 1000);
     expect(CLI_TIMEOUT_ROTA_MS).toBeGreaterThan(MAX_DURATION_S * 1000);
+  });
+
+  test("Reels (um container só): orçamento maior que o do carrossel e ainda com 30s de folga no maxDuration", () => {
+    expect(ORCAMENTO_REELS_MS).toBeGreaterThan(ORCAMENTO_CONTAINERS_MS);
+    expect(ORCAMENTO_REELS_MS + 30_000).toBeLessThanOrEqual(MAX_DURATION_S * 1000);
+    expect(TIPOS.REELS.orcamentoMs).toBe(ORCAMENTO_REELS_MS);
+    expect(TIPOS.CAROUSEL.orcamentoMs).toBeUndefined();
   });
 });
 
@@ -1724,6 +1950,418 @@ describe("scripts/midia.mjs story <arquivo.jpg>", () => {
     const { fetch, chamadas } = servidor();
     await rodar(fetch, { alvo: outro });
     expect(chamadas[0].url).toBe(`${SUPA}/storage/v1/object/instagram-temp/story-20261115-0105-a1b2c3/story.jpg`);
+  });
+});
+
+// ── CLI reels <arquivo.mp4> (fetch falso e ffprobe falso, nunca rede) ─────
+
+// MP4 mínimo: só o box ftyp (o CLI lê os primeiros bytes; duração etc. vêm
+// do ffprobe injetado). Tamanho grande = arquivo esparso (truncateSync), sem
+// ocupar disco nem ler vídeo de verdade.
+function mp4Minimo(marca = "isom") {
+  const ftyp = Buffer.alloc(24);
+  ftyp.writeUInt32BE(24, 0);
+  ftyp.write("ftyp", 4, "latin1");
+  ftyp.write(marca.padEnd(4, " "), 8, "latin1");
+  ftyp.write("isomiso2", 16, "latin1");
+  return Buffer.concat([ftyp, Buffer.alloc(40)]);
+}
+
+// JSON no formato do `ffprobe -show_format -show_streams`.
+const sonda = ({ duracao = 30, w = 1080, h = 1920, fps = "30/1", vcodec = "h264", acodec = "aac", vbps = 8_000_000, abps = 128_000, formato = "mov,mp4,m4a,3gp,3g2,mj2" } = {}) =>
+  vi.fn(() => ({
+    format: { format_name: formato, duration: String(duracao) },
+    streams: [
+      { codec_type: "video", codec_name: vcodec, width: w, height: h, avg_frame_rate: fps, bit_rate: String(vbps) },
+      { codec_type: "audio", codec_name: acodec, bit_rate: String(abps) },
+    ],
+  }));
+
+describe("scripts/midia.mjs reels <arquivo.mp4>", () => {
+  const CHAVE = "eyJhbGciOiJIUzI1NiJ9.chave-service-role-de-teste-0123456789";
+  const SUPA = "https://abcdefgh.supabase.co";
+  const ENV_SB = { SUPABASE_URL: SUPA, SUPABASE_SERVICE_ROLE_KEY: CHAVE };
+  const AGORA = () => new Date("2026-11-27T21:30:00Z");
+  const PREFIXO = "drop-natal-reels-20261127-2130-a1b2c3";
+  const CAMINHO = `${PREFIXO}/drop-natal-reels.mp4`;
+  const PUBLICA = `${SUPA}/storage/v1/object/public/instagram-temp/${CAMINHO}`;
+  const LEG = "Drop de Natal chegou. #tcg #eternizacards\n";
+  const respostaOk = { mediaId: "9001", permalink: "https://www.instagram.com/reel/XYZ/", username: "eternizacards", quota: { usado: 4, total: 50 } };
+
+  let raiz, arquivo, legenda;
+  beforeEach(() => {
+    raiz = mkdtempSync(join(tmpdir(), "reels-"));
+    arquivo = join(raiz, "Drop Natal Reels.mp4");
+    legenda = join(raiz, "legenda.txt");
+    writeFileSync(arquivo, mp4Minimo());
+    writeFileSync(legenda, LEG);
+  });
+  afterEach(() => rmSync(raiz, { recursive: true, force: true }));
+
+  const esparso = (bytes, nome = "Drop Natal Reels.mp4") => {
+    const f = join(raiz, nome);
+    writeFileSync(f, mp4Minimo());
+    truncateSync(f, bytes);
+    return f;
+  };
+
+  // body null = resposta sem JSON (ex.: HTML de erro da Vercel)
+  function servidor({ falha = () => null, resposta = respostaOk } = {}) {
+    const chamadas = [];
+    const fetch = vi.fn(async (url, init = {}) => {
+      const c = { url, metodo: init.method, headers: init.headers, body: init.body };
+      chamadas.push(c);
+      const f = falha(c);
+      if (f instanceof Error) throw f;
+      if (f) {
+        return {
+          ok: f.status < 400,
+          status: f.status,
+          json: async () => {
+            if (f.body === null) throw new SyntaxError("Unexpected token '<'");
+            return f.body ?? {};
+          },
+        };
+      }
+      if (url.endsWith("/api/midia/publicar")) return { ok: true, status: 200, json: async () => resposta };
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    const tipo = (c) =>
+      c.url.endsWith("/api/midia/publicar") ? "rota" : c.metodo === "DELETE" ? "delete" : c.metodo === "POST" ? "upload" : "?";
+    return { fetch, chamadas, tipos: () => chamadas.map(tipo) };
+  }
+  const ehRota = (c) => c.url.endsWith("/api/midia/publicar");
+  const vars = (extra = {}) => (nome) => ({ PUBLICAR_SECRET: SEGREDO, MANYWATA_URL: "https://manywata.vercel.app", ...extra })[nome];
+  const rodar = (fetch, { argv = ["--confirmar"], alvo = arquivo, leg = ["--legenda", legenda], env = ENV_SB, lerVar = vars(), ffprobe = sonda(), ...resto } = {}) =>
+    executar(["reels", alvo, ...leg, ...argv], {
+      fetch,
+      env,
+      lerVar,
+      agora: AGORA,
+      sufixo: "a1b2c3",
+      ffprobe,
+      log: () => {},
+      avisar: () => {},
+      ...resto,
+    });
+
+  test("sem --confirmar: dry-run, zero fetch, mostra URL pública, tipo REELS e legenda", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    const r = await rodar(fetch, { argv: [], log: (l) => linhas.push(l) });
+    expect(r).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    const saida = linhas.join("\n");
+    expect(saida).toMatch(/sem --confirmar: só mostrando/);
+    expect(saida).toContain(`instagram-temp/${CAMINHO}`);
+    expect(saida).toContain(PUBLICA);
+    expect(saida).toContain('"tipo": "REELS"');
+    expect(saida).toContain('"video_url"');
+    expect(saida).toContain("Drop de Natal chegou.");
+    expect(saida).toMatch(/subiria 1 arquivo\(s\)/);
+    expect(saida).not.toMatch(/JPEG\(s\)/);
+    expect(saida).toMatch(/30\.0s · 1080x1920 · 30 fps · vídeo h264/);
+  });
+
+  test("--dry-run: zero fetch, mesmo com --confirmar", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    await expect(rodar(fetch, { argv: ["--confirmar", "--dry-run"], log: (l) => linhas.push(l) })).resolves.toBeNull();
+    await expect(rodar(fetch, { argv: ["--dry-run"] })).resolves.toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(linhas.join("\n")).not.toMatch(/sem --confirmar/);
+  });
+
+  test("dry-run sem credenciais nem PUBLICAR_SECRET: zero fetch, só avisa", async () => {
+    const { fetch } = servidor();
+    const linhas = [];
+    await rodar(fetch, { argv: [], env: {}, lerVar: vars({ PUBLICAR_SECRET: undefined }), log: (l) => linhas.push(l) });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(linhas.join("\n")).toMatch(/ausentes[\s\S]*<SUPABASE_URL>\/storage/);
+  });
+
+  test("--confirmar: sobe com video/mp4, chama a rota com REELS + legenda e apaga depois", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    const linhas = [];
+    const r = await rodar(fetch, { log: (l) => linhas.push(l) });
+
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+    const up = chamadas[0];
+    expect(up.url).toBe(`${SUPA}/storage/v1/object/instagram-temp/${CAMINHO}`);
+    expect(up.headers).toEqual({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE, "Content-Type": "video/mp4", "x-upsert": "false" });
+    expect(Buffer.from(up.body).equals(mp4Minimo())).toBe(true);
+
+    const rota = chamadas[1];
+    expect(rota.headers.Authorization).toBe(`Bearer ${SEGREDO}`);
+    expect(JSON.parse(rota.body)).toEqual({ conta: "eterniza", tipo: "REELS", itens: [{ video_url: PUBLICA }], legenda: LEG, confirmar: true });
+    // o corpo que o CLI manda passa na validação da rota
+    expect(TIPOS.REELS.validar(JSON.parse(rota.body)).itens).toEqual([PUBLICA]);
+
+    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
+    const saida = linhas.join("\n");
+    expect(saida).toMatch(/Publicando reels \(1 vídeo\)/);
+    expect(saida).toMatch(/Subindo 1 arquivo\(s\)/);
+    expect(saida).toContain(respostaOk.permalink);
+    expect(saida).toMatch(/Temporários apagados/);
+  });
+
+  test(".mov sobe como video/quicktime com extensão .mov", async () => {
+    const mov = join(raiz, "clip.MOV");
+    writeFileSync(mov, mp4Minimo("qt"));
+    const { fetch, chamadas } = servidor();
+    await rodar(fetch, { alvo: mov });
+    expect(chamadas[0].url).toMatch(/\/clip-20261127-2130-a1b2c3\/clip\.mov$/);
+    expect(chamadas[0].headers["Content-Type"]).toBe("video/quicktime");
+  });
+
+  test("--conta é repassada", async () => {
+    const { fetch, chamadas } = servidor();
+    await rodar(fetch, { argv: ["--confirmar", "--conta", "outra"] });
+    expect(JSON.parse(chamadas.find(ehRota).body).conta).toBe("outra");
+  });
+
+  test.each([
+    ["504 da rota (publicado: false)", (c) => (ehRota(c) ? { status: 504, body: { erro: "container 1000 não ficou pronto em 270s (último status: IN_PROGRESS). Nada foi publicado.", publicado: false } } : null), /HTTP 504/],
+    ["falha de rede", (c) => (ehRota(c) ? new TypeError("fetch failed") : null), /Pode ter publicado mesmo assim/],
+    ["resposta sem JSON", (c) => (ehRota(c) ? { status: 502, body: null } : null), /sem detalhe/],
+    ["erro sem publicado: false", (c) => (ehRota(c) ? { status: 502, body: { erro: "Instagram recusou POST media_publish" } } : null), /não confirmou se publicou/],
+  ])("%s → NÃO apaga e mostra o limpar", async (_n, falha, msg) => {
+    const { fetch, tipos } = servidor({ falha });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(msg);
+    expect(e.message).toMatch(/temporários NÃO foram apagados/);
+    expect(e.message).toContain(`instagram-temp/${CAMINHO}`);
+    expect(e.message).toContain(`node scripts/midia.mjs limpar ${PREFIXO} --confirmar`);
+    expect(tipos()).toEqual(["upload", "rota"]);
+  });
+
+  test("erro da rota {erro, publicado: false} (não 504) → apaga", async () => {
+    const { fetch, chamadas, tipos } = servidor({
+      falha: (c) => (ehRota(c) ? { status: 502, body: { erro: "container 1000 falhou no Instagram (ERROR)", publicado: false } } : null),
+    });
+    await expect(rodar(fetch)).rejects.toThrow(/HTTP 502[\s\S]*Nada foi publicado/);
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
+  });
+
+  test("--base-url: só chama a rota, com <base>/<nome do arquivo>, sem Storage", async () => {
+    const { fetch, chamadas, tipos } = servidor();
+    const r = await rodar(fetch, { argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/rl"] });
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(["rota"]);
+    expect(JSON.parse(chamadas[0].body)).toEqual({
+      conta: "eterniza",
+      tipo: "REELS",
+      itens: [{ video_url: "https://cdn.exemplo.com/rl/Drop%20Natal%20Reels.mp4" }],
+      legenda: LEG,
+      confirmar: true,
+    });
+  });
+
+  test("--base-url com vídeo > 8 MB: o limite do bucket não se aplica", async () => {
+    const grande = esparso(MAX_BYTES + 1);
+    const { fetch, tipos } = servidor();
+    await rodar(fetch, { alvo: grande, argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/rl"] });
+    expect(tipos()).toEqual(["rota"]);
+  });
+
+  test("falta --legenda / legenda inexistente → recusa sem rede", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { leg: [] })).rejects.toThrow(/Falta --legenda <arquivo\.txt>/);
+    await expect(rodar(fetch, { leg: [], argv: [] })).rejects.toThrow(/Falta --legenda/);
+    await expect(rodar(fetch, { leg: ["--legenda", join(raiz, "nao-existe.txt")] })).rejects.toThrow(/Não consegui ler a legenda/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("legenda acima do limite do Instagram → recusa sem rede", async () => {
+    writeFileSync(legenda, "a".repeat(2201));
+    const { fetch } = servidor();
+    await expect(rodar(fetch)).rejects.toThrow(/2201 caracteres/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("arquivo inexistente / diretório / sem arquivo → recusa sem rede", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { alvo: join(raiz, "nao-existe.mp4") })).rejects.toThrow(/Não consegui ler o arquivo/);
+    await expect(rodar(fetch, { alvo: raiz })).rejects.toThrow(/Não consegui ler o arquivo/);
+    await expect(executar(["reels", "--confirmar"], { fetch, lerVar: vars() })).rejects.toThrow(/Falta o arquivo MP4/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["JPEG com extensão .mp4", "x.mp4", () => Buffer.from([0xff, 0xd8, 0xff, 0xe0, ...Buffer.alloc(40)]), /não é MP4\/MOV \(não tem a assinatura ftyp/],
+    ["arquivo vazio", "x.mp4", () => Buffer.alloc(0), /não tem a assinatura ftyp/],
+    ["extensão .avi", "x.avi", () => mp4Minimo(), /não é MP4 \(extensão \.avi/],
+    ["extensão .jpg", "x.jpg", () => mp4Minimo(), /não é MP4 \(extensão \.jpg/],
+  ])("%s → recusa sem rede e sem ffprobe", async (_n, nome, bytes, msg) => {
+    const f = join(raiz, nome);
+    writeFileSync(f, bytes());
+    const { fetch } = servidor();
+    const ffprobe = sonda();
+    await expect(rodar(fetch, { alvo: f, ffprobe })).rejects.toThrow(msg);
+    await expect(rodar(fetch, { alvo: f, ffprobe, argv: [] })).rejects.toThrow(msg);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(ffprobe).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["2,9s", 2.9, /2\.9s; o Instagram aceita Reels de 3s a 15min/],
+    ["15min01s", 901, /15min01s; o Instagram aceita Reels de 3s a 15min/],
+  ])("duração %s (ffprobe) → recusa sem rede, inclusive no dry-run", async (_n, duracao, msg) => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { ffprobe: sonda({ duracao }) })).rejects.toThrow(msg);
+    await expect(rodar(fetch, { ffprobe: sonda({ duracao }), argv: [] })).rejects.toThrow(msg);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([3, 900])("duração %is (limite exato) passa", async (duracao) => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { ffprobe: sonda({ duracao }) })).resolves.toMatchObject({ mediaId: "9001" });
+  });
+
+  test("container que o ffprobe não reconhece como mp4/mov → recusa sem rede", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { ffprobe: sonda({ formato: "matroska,webm" }) })).rejects.toThrow(/container é "matroska,webm"/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("> 300 MB → recusa sem rede (limite do Instagram)", async () => {
+    const enorme = esparso(300 * 1024 * 1024 + 1);
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { alvo: enorme })).rejects.toThrow(/limite do Instagram pra Reels é 300 MB/);
+    await expect(rodar(fetch, { alvo: enorme, argv: [] })).rejects.toThrow(/300 MB/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("> 8 MB com --confirmar → recusa antes de qualquer rede, falando do bucket", async () => {
+    const grande = esparso(MAX_BYTES + 1);
+    const { fetch } = servidor();
+    const e = await rodar(fetch, { alvo: grande }).catch((x) => x);
+    expect(e.message).toMatch(/^Recusado:/);
+    expect(e.message).toMatch(/bucket instagram-temp hoje aceita só image\/jpeg até 8 MB/);
+    expect(e.message).toMatch(/TUS/);
+    expect(e.message).toMatch(/ok do Vinicius/);
+    expect(e.message).toMatch(/Nada foi enviado/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("> 8 MB com --confirmar mas sem SUPABASE_*: a mensagem é a do bucket, não a das credenciais", async () => {
+    const grande = esparso(MAX_BYTES + 1);
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { alvo: grande, env: {} })).rejects.toThrow(/bucket instagram-temp/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("dry-run de um MP4 de 50.653.437 bytes (válido pro Instagram): zero fetch, avisa o bucket e o teto Free, mostra o payload", async () => {
+    const grande = esparso(50_653_437);
+    const { fetch } = servidor();
+    const linhas = [];
+    const avisos = [];
+    const r = await rodar(fetch, { alvo: grande, argv: [], log: (l) => linhas.push(l), avisar: (l) => avisos.push(l) });
+    expect(r).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    const aviso = avisos.join("\n");
+    expect(aviso).toMatch(/48,31 MiB \(50,65 MB, 50\.653\.437 bytes\)/);
+    expect(aviso).toMatch(/hoje aceita só image\/jpeg até 8 MB: o Storage vai recusar/);
+    expect(aviso).toMatch(/TUS \(upload resumível\) não resolve/);
+    expect(aviso).toMatch(/ok do Vinicius/);
+    expect(aviso).toMatch(/50\.000\.000 bytes[\s\S]*reencode/);
+    expect(aviso).not.toMatch(/Pro/);
+    const saida = linhas.join("\n");
+    expect(saida).toContain('"tipo": "REELS"');
+    expect(saida).toContain(PUBLICA);
+  });
+
+  test("MP4 entre 8 MB e 50.000.000 bytes: avisa o bucket, mas não fala em reencodar", async () => {
+    const grande = esparso(20 * 1024 * 1024);
+    const { fetch } = servidor();
+    const avisos = [];
+    await rodar(fetch, { alvo: grande, argv: ["--dry-run"], avisar: (l) => avisos.push(l) });
+    expect(avisos.join("\n")).toMatch(/Storage vai recusar/);
+    expect(avisos.join("\n")).not.toMatch(/reencode/);
+  });
+
+  test("sem ffprobe: avisa que a duração não foi conferida e segue", async () => {
+    const { fetch } = servidor();
+    const avisos = [];
+    const r = await rodar(fetch, { ffprobe: () => null, avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(avisos.join("\n")).toMatch(/ffprobe não encontrado[\s\S]*duração[\s\S]*NÃO foram conferidos/);
+  });
+
+  test("ffprobe falhou ao ler: avisa e segue", async () => {
+    const { fetch } = servidor();
+    const avisos = [];
+    await rodar(fetch, { argv: [], ffprobe: () => ({ erro: "moov atom not found" }), avisar: (l) => avisos.push(l) });
+    expect(avisos.join("\n")).toMatch(/moov atom not found/);
+  });
+
+  test("recomendações fora do ideal só avisam (9:16, largura, fps, codecs, bitrates)", async () => {
+    const { fetch, tipos } = servidor();
+    const avisos = [];
+    const ffprobe = sonda({ w: 3840, h: 2160, fps: "120/1", vcodec: "vp9", acodec: "opus", vbps: 40_000_000, abps: 256_000 });
+    const r = await rodar(fetch, { ffprobe, avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+    const a = avisos.join("\n");
+    expect(a).toMatch(/3840x2160; o recomendado pra Reels é 9:16 \(1080x1920\)/);
+    expect(a).toMatch(/largura 3840 passa de 1920/);
+    expect(a).toMatch(/120 fps; o recomendado é de 23 a 60/);
+    expect(a).toMatch(/codec de vídeo vp9/);
+    expect(a).toMatch(/codec de áudio opus/);
+    expect(a).toMatch(/40\.0 Mbps; o recomendado é até 25 Mbps/);
+    expect(a).toMatch(/256 kbps; o recomendado é até 128 kbps/);
+  });
+
+  test("1080x1920 h264/aac 30fps: nenhum aviso", async () => {
+    const { fetch } = servidor();
+    const avisos = [];
+    await rodar(fetch, { avisar: (l) => avisos.push(l) });
+    expect(avisos).toEqual([]);
+  });
+
+  test("vídeo gravado em pé (1920x1080 com rotação 90) conta como 1080x1920", async () => {
+    const { fetch } = servidor();
+    const avisos = [];
+    const ffprobe = vi.fn(() => ({
+      format: { format_name: "mov,mp4,m4a,3gp,3g2,mj2", duration: "12" },
+      streams: [{ codec_type: "video", codec_name: "hevc", width: 1920, height: 1080, avg_frame_rate: "30000/1001", side_data_list: [{ rotation: -90 }] }],
+    }));
+    await rodar(fetch, { argv: [], ffprobe, avisar: (l) => avisos.push(l) });
+    expect(avisos).toEqual([]);
+  });
+
+  test("sem SUPABASE_* ou sem PUBLICAR_SECRET com --confirmar → recusa e zero fetch", async () => {
+    const { fetch } = servidor();
+    await expect(rodar(fetch, { env: {} })).rejects.toThrow(/SUPABASE_URL/);
+    await expect(rodar(fetch, { lerVar: vars({ PUBLICAR_SECRET: undefined }) })).rejects.toThrow(/PUBLICAR_SECRET/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("a chave do Supabase e o PUBLICAR_SECRET nunca aparecem em log ou erro, mesmo com o servidor ecoando", async () => {
+    const eco = `chave ${CHAVE} segredo ${SEGREDO}`;
+    const saida = [];
+    const coletar = (l) => saida.push(String(l));
+    const casos = [
+      { falha: (c) => (ehRota(c) ? { status: 400, body: { erro: eco, publicado: false } } : null) },
+      { falha: (c) => (ehRota(c) ? { status: 504, body: { erro: eco, publicado: false } } : null) },
+      { falha: (c) => (ehRota(c) ? new TypeError(eco) : null) },
+      { falha: (c) => (!ehRota(c) && c.metodo === "POST" ? { status: 403, body: { message: eco } } : null) },
+      { falha: (c) => (c.metodo === "DELETE" ? { status: 500, body: { message: eco } } : null) },
+    ];
+    for (const caso of casos) {
+      const { fetch } = servidor(caso);
+      const e = await rodar(fetch, { log: coletar, avisar: coletar }).catch((x) => x);
+      if (e instanceof Error) saida.push(e.message);
+    }
+    // dry-run com tudo configurado também não imprime credencial
+    await rodar(servidor().fetch, { argv: [], log: coletar, avisar: coletar });
+    const tudo = saida.join("\n");
+    expect(tudo).toMatch(/HTTP 400/); // houve saída de erro de verdade
+    expect(tudo).toMatch(/HTTP 403/);
+    expect(tudo).not.toContain(CHAVE);
+    expect(tudo).not.toContain(SEGREDO);
   });
 });
 

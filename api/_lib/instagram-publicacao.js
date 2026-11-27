@@ -15,6 +15,7 @@
 
 import { ErroHttp, sanitizar, validarUrlPublica } from "./seguranca.js";
 import {
+  ORCAMENTO_REELS_MS,
   STATUS_CHECAGENS_MINIMAS,
   STATUS_ESPERA_MINIMA_MS,
   STATUS_INTERVALO_INICIAL_MS,
@@ -34,6 +35,11 @@ export const LIMITES = {
 };
 
 const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// O que conferir quando o Meta devolve status ERROR no container.
+const DICA_ERRO_IMAGEM = "Confira se a URL abre de fora e é um JPEG.";
+const DICA_ERRO_VIDEO =
+  "Confira se a URL abre de fora e se o vídeo está nos limites do Reels (MP4/MOV, H.264/HEVC + AAC, 3s a 15min, até 300 MB).";
 
 // ── Cliente do Graph para UMA conta ───────────────────────────────────────
 
@@ -92,7 +98,9 @@ export function criarPublicador({
   //
   // signal (opcional): quando outro container do mesmo lote já falhou, para
   // de checar este na próxima volta, sem publicar nada.
-  async function aguardarStatus(containerId, { timeoutMs = 30_000, signal } = {}) {
+  // dica (opcional): o que conferir quando o container dá ERROR (padrão:
+  // imagem JPEG; Reels passa a dica de vídeo).
+  async function aguardarStatus(containerId, { timeoutMs = 30_000, signal, dica = DICA_ERRO_IMAGEM } = {}) {
     const inicio = now();
     const limite = Math.max(Number(timeoutMs) || 0, esperaMinimaMs);
     let intervalo = intervaloMs;
@@ -106,7 +114,7 @@ export function criarPublicador({
       if (codigo === "ERROR") {
         throw new ErroHttp(
           502,
-          sanitizar(`container ${containerId} falhou no Instagram (ERROR): ${r.status || "sem detalhe"}. Confira se a URL abre de fora e é um JPEG.`, [token])
+          sanitizar(`container ${containerId} falhou no Instagram (ERROR): ${r.status || "sem detalhe"}. ${dica}`, [token])
         );
       }
       if (codigo === "EXPIRED") {
@@ -228,12 +236,14 @@ export async function emParalelo(tarefas, rotulo = (i) => `item ${i + 1}`) {
 //
 // Cada tipo de mídia é uma entrada. A rota é genérica: pega o tipo do body,
 // chama validar() (antes de qualquer fetch) e criarContainers(), e publica o
-// container que voltar. Pra ligar Reels é só implementar a entrada e virar
+// container que voltar. Tipo novo: implementar a entrada e virar
 // `implementado: true`.
 //
-//   validar(corpo)                     → { itens: [url...], legenda? }  (ou ErroHttp 400/501)
+//   validar(corpo)                     → { itens: [url...], legenda?, ... }  (ou ErroHttp 400/501)
 //   criarContainers(pub, dados, ctx)   → id do container FINAL, já FINISHED
 //     ctx.restanteMs()                 → quanto do orçamento de tempo sobrou
+//   orcamentoMs (opcional)             → orçamento dos containers deste tipo
+//                                        (padrão ORCAMENTO_CONTAINERS_MS)
 //   permalinkOpcional (opcional)       → true: falha ao buscar o permalink
 //                                        depois de publicar não gera aviso
 
@@ -291,27 +301,64 @@ export const TIPOS = {
     },
   },
 
-  // Falta (ver README, "O que falta para Reels e Stories"):
-  //   validar: 1 item com url de vídeo (MP4/MOV, https), legenda via
-  //     validarLegenda, cover_url opcional (JPEG público), share_to_feed
-  //     opcional (booleano)
-  //   criarContainers: criarContainer({ media_type: "REELS", video_url,
-  //     caption, cover_url?, share_to_feed? }) e aguardarStatus com timeout
-  //     maior — vídeo pode levar vários minutos, e nem os 300s da função
-  //     (api/_lib/tempos.js) garantem; precisa dividir em "cria o container"
-  //     + "checa status e publica".
+  // Reels: 1 vídeo (MP4/MOV) em URL https pública, legenda opcional,
+  // cover_url (JPEG) e share_to_feed (booleano) opcionais no corpo.
+  //
+  // Tempo: um container só, então usa ORCAMENTO_REELS_MS (270s) em vez dos
+  // 240s do carrossel. Vídeo longo ainda pode não ficar FINISHED dentro dos
+  // 300s da função (504, nada publicado). Dividir em duas chamadas ("cria o
+  // container" + "checa status e publica") é outro desenho, fora daqui.
   REELS: {
-    implementado: false,
-    descricao: "Reels (video_url, media_type=REELS, cover_url/share_to_feed opcionais)",
+    implementado: true,
+    descricao: "Reels de 1 vídeo MP4/MOV (legenda, cover_url e share_to_feed opcionais)",
+    orcamentoMs: ORCAMENTO_REELS_MS,
+
+    validar(corpo) {
+      const itens = corpo.itens;
+      if (!Array.isArray(itens)) {
+        throw new ErroHttp(400, 'itens precisa ser uma lista com 1 item: [{"video_url": "https://.../video.mp4"}].');
+      }
+      if (itens.length !== 1) {
+        throw new ErroHttp(400, `Reels leva exatamente 1 vídeo (veio ${itens.length}).`);
+      }
+      const videoUrl = urlDoVideo(itens[0]);
+
+      const dados = { itens: [videoUrl], legenda: validarLegenda(corpo.legenda) };
+      if (corpo.cover_url !== undefined && corpo.cover_url !== null) {
+        const capa = validarUrlPublica(corpo.cover_url, "cover_url");
+        exigirJpeg(capa, "cover_url");
+        dados.coverUrl = capa;
+      }
+      if (corpo.share_to_feed !== undefined) {
+        // Booleano estrito, como confirmar: "true" ou 1 não valem.
+        if (typeof corpo.share_to_feed !== "boolean") {
+          throw new ErroHttp(400, "share_to_feed precisa ser booleano (true ou false).");
+        }
+        dados.shareToFeed = corpo.share_to_feed;
+      }
+      return dados;
+    },
+
+    async criarContainers(pub, { itens, legenda, coverUrl, shareToFeed }, ctx) {
+      const params = { media_type: "REELS", video_url: itens[0] };
+      if (legenda) params.caption = legenda;
+      if (coverUrl) params.cover_url = coverUrl;
+      if (shareToFeed !== undefined) params.share_to_feed = shareToFeed;
+      const id = await pub.criarContainer(params);
+      // ERROR / EXPIRED abortam aqui dentro, antes de qualquer media_publish.
+      await pub.aguardarStatus(id, { timeoutMs: ctx.restanteMs(), dica: DICA_ERRO_VIDEO });
+      return id;
+    },
+    // Reels tem permalink: se faltar depois de publicar, volta 200 com aviso.
   },
 
   // Story de IMAGEM: 1 JPEG, sem legenda (Story não tem caption na API).
   //
-  // Story de VÍDEO continua 501 (ver README, "O que falta para Reels e
-  // Stories"). Falta: aceitar video_url (MP4/MOV), criarContainer({
-  // media_type: "STORIES", video_url }), e o mesmo problema de tempo do
-  // Reels (processar vídeo pode passar dos 300s da função), além de outro
-  // bucket/regra de MIME pra hospedar o vídeo.
+  // Story de VÍDEO continua 501 (ver README, "O que falta para Stories de
+  // vídeo"). Falta: aceitar video_url (MP4/MOV), criarContainer({
+  // media_type: "STORIES", video_url }), o mesmo limite de tempo do Reels
+  // (processar vídeo pode passar dos 300s da função) e o bucket aceitar
+  // vídeo (hoje só image/jpeg até 8 MB).
   //
   // Stickers interativos (enquete, link, pergunta, menção clicável) NÃO
   // existem na API de publicação: o story sai só com a imagem.
@@ -331,7 +378,7 @@ export const TIPOS = {
       if (ehVideo(item)) {
         throw new ErroHttp(
           501,
-          "story de vídeo ainda não implementado (só imagem JPEG por enquanto). Ver README, \"O que falta para Reels e Stories\"."
+          "story de vídeo ainda não implementado (só imagem JPEG por enquanto). Pra vídeo use tipo REELS. Ver README, \"O que falta para Stories de vídeo\"."
         );
       }
       const url = validarUrlPublica(item?.url, "itens[0].url");
@@ -370,6 +417,35 @@ function ehVideo(item) {
   } catch {
     return false;
   }
+}
+
+const EXT_VIDEO = ["mp4", "mov", "m4v"];
+const extensao = (url) => /\.([a-z0-9]+)$/.exec(new URL(url).pathname.toLowerCase())?.[1];
+
+// URL do vídeo do Reels: itens[0].video_url (qualquer caminho, desde que não
+// tenha extensão de outra coisa) ou itens[0].url terminando em .mp4/.mov/.m4v.
+// https público nos dois casos.
+function urlDoVideo(item) {
+  if (item && typeof item === "object" && item.video_url !== undefined) {
+    const url = validarUrlPublica(item.video_url, "itens[0].video_url");
+    const ext = extensao(url);
+    if (ext && !EXT_VIDEO.includes(ext)) {
+      throw new ErroHttp(400, `itens[0].video_url: Reels precisa de vídeo MP4/MOV (veio .${ext}).`);
+    }
+    return url;
+  }
+  if (item?.url === undefined || item?.url === null || item?.url === "") {
+    throw new ErroHttp(400, 'itens[0]: falta a URL do vídeo (video_url, ou url terminando em .mp4/.mov/.m4v).');
+  }
+  const url = validarUrlPublica(item.url, "itens[0].url");
+  const ext = extensao(url);
+  if (!ext || !EXT_VIDEO.includes(ext)) {
+    throw new ErroHttp(
+      400,
+      `itens[0].url: Reels precisa de vídeo MP4/MOV (${ext ? `veio .${ext}` : "URL sem extensão; use video_url"}).`
+    );
+  }
+  return url;
 }
 
 // Resolve o tipo pedido. Desconhecido → 400; conhecido mas não pronto → 501.

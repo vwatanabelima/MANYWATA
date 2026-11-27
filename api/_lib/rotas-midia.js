@@ -16,8 +16,9 @@
 import { contaPorSlug, tokenDaConta } from "../contas.js";
 import { ErroHttp, autenticar, sanitizar } from "./seguranca.js";
 import { criarPublicador, tipoDefinido } from "./instagram-publicacao.js";
-// Orçamento dos containers (240s) dentro do maxDuration da função (300s,
-// vercel.json). A relação entre os tempos está explicada em tempos.js.
+// Orçamento dos containers (240s; Reels 270s via TIPOS.REELS.orcamentoMs)
+// dentro do maxDuration da função (300s, vercel.json). A relação entre os
+// tempos está explicada em tempos.js.
 import { ORCAMENTO_CONTAINERS_MS } from "./tempos.js";
 
 function contexto(opcoes = {}) {
@@ -28,7 +29,8 @@ function contexto(opcoes = {}) {
     sleep: opcoes.sleep,
     now: opcoes.now || Date.now,
     intervaloMs: opcoes.intervaloMs,
-    orcamentoMs: opcoes.orcamentoMs ?? ORCAMENTO_CONTAINERS_MS,
+    // undefined: usa o do tipo (def.orcamentoMs) ou o padrão; os testes forçam
+    orcamentoMs: opcoes.orcamentoMs,
     tipoFixo: opcoes.tipoFixo,
     // tudo que nunca pode sair numa resposta/log; o token entra depois
     segredos: [env.PUBLICAR_SECRET].filter(Boolean),
@@ -81,6 +83,7 @@ function lerCorpo(req) {
 // ── POST /api/midia/publicar ──────────────────────────────────────────────
 // body: { conta: "eterniza", tipo: "CAROUSEL", itens: [{ url }], legenda, confirmar: true }
 //       { conta: "eterniza", tipo: "STORIES", itens: [{ url }], confirmar: true }  (1 JPEG, sem legenda)
+//       { conta: "eterniza", tipo: "REELS", itens: [{ video_url }], legenda, cover_url?, share_to_feed?, confirmar: true }
 // No alias /api/carrossel/publicar o tipo é fixo (CAROUSEL) e pode ser omitido.
 
 export async function rotaPublicar(req, res, opcoes = {}) {
@@ -132,8 +135,9 @@ export async function rotaPublicar(req, res, opcoes = {}) {
       );
     }
 
-    // ── 3. Containers (carrossel: filhos + final; story: um só), FINISHED ─
-    const prazo = ctx.now() + ctx.orcamentoMs;
+    // ── 3. Containers (carrossel: filhos + final; story/Reels: um só), FINISHED ─
+    const orcamento = ctx.orcamentoMs ?? def.orcamentoMs ?? ORCAMENTO_CONTAINERS_MS;
+    const prazo = ctx.now() + orcamento;
     const containerId = await def.criarContainers(pub, dados, { restanteMs: () => prazo - ctx.now() });
 
     // ── 4. Publica ────────────────────────────────────────────────────────
@@ -145,7 +149,8 @@ export async function rotaPublicar(req, res, opcoes = {}) {
     // ── 5. Permalink. O post JÁ está no ar: falha aqui não pode virar erro,
     //       senão alguém tenta de novo achando que não publicou.
     //       Tipos com permalinkOpcional (STORIES): sem permalink é normal,
-    //       volta permalink: null sem aviso.
+    //       volta permalink: null sem aviso. Os outros (CAROUSEL, REELS)
+    //       voltam com aviso, tanto se o GET falhar quanto se vier sem link.
     let permalink = null;
     let aviso;
     try {
@@ -158,6 +163,11 @@ export async function rotaPublicar(req, res, opcoes = {}) {
         aviso = `publicado, mas não deu pra buscar o permalink: ${detalhe}. NÃO publique de novo; confira no perfil.`;
         console.warn(`[${conta.slug}] ${aviso}`);
       }
+    }
+    // Graph respondeu, mas sem permalink: mesmo aviso (carrossel e Reels têm link).
+    if (!permalink && !aviso && !def.permalinkOpcional) {
+      aviso = "publicado, mas o Instagram não devolveu o permalink. NÃO publique de novo; confira no perfil.";
+      console.warn(`[${conta.slug}] ${aviso}`);
     }
 
     return res.status(200).json({
