@@ -1226,6 +1226,14 @@ describe("o access token nunca aparece em resposta, erro ou log", () => {
     const s = sanitizar(`GET /me?access_token=abc123&x=1 Authorization: Bearer xyz ${TOKEN}`, [TOKEN]);
     expect(s).toBe("GET /me?access_token=[oculto]&x=1 Authorization: Bearer [oculto] [oculto]");
   });
+
+  test("sanitizar cobre Authorization: OAuth <token> (rupload) sem comer a mensagem do Meta", () => {
+    expect(sanitizar(`Authorization: OAuth ${TOKEN}`, [TOKEN])).toBe("Authorization: OAuth [oculto]");
+    expect(sanitizar("headers: {Authorization: OAuth IGQVJtokenDesconhecido123}")).toBe("headers: {Authorization: OAuth [oculto]}");
+    expect(sanitizar("oauth IGQVJtokenDesconhecido123")).toBe("OAuth [oculto]");
+    expect(sanitizar("Invalid OAuth access token - Cannot parse access token")).toBe("Invalid OAuth access token - Cannot parse access token");
+    expect(sanitizar("OAuthException code 190")).toBe("OAuthException code 190");
+  });
 });
 
 // ── URLs ──────────────────────────────────────────────────────────────────
@@ -1977,66 +1985,113 @@ const sonda = ({ duracao = 30, w = 1080, h = 1920, fps = "30/1", vcodec = "h264"
     ],
   }));
 
-describe("scripts/midia.mjs reels <arquivo.mp4>", () => {
+describe("scripts/midia.mjs reels <arquivo.mp4> (direto com o Instagram, rupload)", () => {
   const CHAVE = "eyJhbGciOiJIUzI1NiJ9.chave-service-role-de-teste-0123456789";
   const SUPA = "https://abcdefgh.supabase.co";
+  const ENV_IG = { IG_ACCESS_TOKEN_ETERNIZA: TOKEN };
   const ENV_SB = { SUPABASE_URL: SUPA, SUPABASE_SERVICE_ROLE_KEY: CHAVE };
+  const ENV_TUDO = { ...ENV_IG, ...ENV_SB };
   const AGORA = () => new Date("2026-11-27T21:30:00Z");
   const PREFIXO = "drop-natal-reels-20261127-2130-a1b2c3";
-  const CAMINHO = `${PREFIXO}/drop-natal-reels.mp4`;
-  const PUBLICA = `${SUPA}/storage/v1/object/public/instagram-temp/${CAMINHO}`;
+  const CAMINHO_CAPA = `${PREFIXO}/drop-natal-reels.jpg`;
+  const PUBLICA_CAPA = `${SUPA}/storage/v1/object/public/instagram-temp/${CAMINHO_CAPA}`;
   const LEG = "Drop de Natal chegou. #tcg #eternizacards\n";
-  const respostaOk = { mediaId: "9001", permalink: "https://www.instagram.com/reel/XYZ/", username: "eternizacards", quota: { usado: 4, total: 50 } };
+  const CAPTION = "Drop de Natal chegou. #tcg #eternizacards";
+  const URI = "https://rupload.facebook.com/ig-api-upload/v21.0/1000";
+  const PERMALINK = "https://www.instagram.com/reel/XYZ/";
+  const FELIZ = ["cota", "container", "rupload", "status", "publish", "permalink"];
+  const FELIZ_CAPA = ["cota", "upload", "container", "rupload", "status", "publish", "permalink", "delete"];
+  const CAPA_BYTES = jpegComDimensoes(1080, 1920);
 
-  let raiz, arquivo, legenda;
+  let raiz, arquivo, legenda, capa;
   beforeEach(() => {
     raiz = mkdtempSync(join(tmpdir(), "reels-"));
     arquivo = join(raiz, "Drop Natal Reels.mp4");
     legenda = join(raiz, "legenda.txt");
+    capa = join(raiz, "capa.jpg");
     writeFileSync(arquivo, mp4Minimo());
     writeFileSync(legenda, LEG);
+    writeFileSync(capa, CAPA_BYTES);
   });
   afterEach(() => rmSync(raiz, { recursive: true, force: true }));
 
-  const esparso = (bytes, nome = "Drop Natal Reels.mp4") => {
+  // Arquivo grande sem ocupar disco (esparso) e sem ler vídeo de verdade.
+  const esparso = (bytes, nome = "Drop Natal Reels.mp4", cabeca = mp4Minimo()) => {
     const f = join(raiz, nome);
-    writeFileSync(f, mp4Minimo());
+    writeFileSync(f, cabeca);
     truncateSync(f, bytes);
     return f;
   };
 
-  // body null = resposta sem JSON (ex.: HTML de erro da Vercel)
-  function servidor({ falha = () => null, resposta = respostaOk } = {}) {
+  // Imita graph.instagram.com, rupload.facebook.com e o Supabase Storage.
+  // `uri(id)`: o que o POST /media devolve em `uri` (null = não devolve).
+  // `falha(chamada)`: Error = falha de rede; {status, body} = resposta.
+  function igFalso({
+    quota = 0,
+    total = 50,
+    uri = (id) => `https://rupload.facebook.com/ig-api-upload/v21.0/${id}`,
+    status = () => "FINISHED",
+    statusTexto = "Error: Video processing failed",
+    falha = () => null,
+  } = {}) {
     const chamadas = [];
     const fetch = vi.fn(async (url, init = {}) => {
-      const c = { url, metodo: init.method, headers: init.headers, body: init.body };
+      const u = new URL(url);
+      const metodo = init.method || "GET";
+      const c = { url, metodo, headers: init.headers, body: init.body, tipo: "?" };
+      if (u.hostname === "graph.instagram.com") {
+        c.caminho = u.pathname.replace(/^\/v21\.0\//, "");
+        c.params = metodo === "GET" ? Object.fromEntries(u.searchParams) : JSON.parse(init.body);
+        if (c.caminho.endsWith("/content_publishing_limit")) c.tipo = "cota";
+        else if (metodo === "POST" && c.caminho.endsWith("/media_publish")) c.tipo = "publish";
+        else if (metodo === "POST" && c.caminho.endsWith("/media")) c.tipo = "container";
+        else if (c.params.fields === "status_code,status") c.tipo = "status";
+        else if (c.params.fields === "permalink") c.tipo = "permalink";
+      } else if (u.hostname === "rupload.facebook.com") {
+        c.tipo = "rupload";
+      } else if (u.origin === SUPA) {
+        c.tipo = metodo === "DELETE" ? "delete" : "upload";
+      }
       chamadas.push(c);
+      const res = (body, st = 200) => ({ ok: st < 400, status: st, json: async () => body });
       const f = falha(c);
       if (f instanceof Error) throw f;
-      if (f) {
-        return {
-          ok: f.status < 400,
-          status: f.status,
-          json: async () => {
-            if (f.body === null) throw new SyntaxError("Unexpected token '<'");
-            return f.body ?? {};
-          },
-        };
+      if (f) return res(f.body ?? {}, f.status);
+      switch (c.tipo) {
+        case "cota":
+          return res({ data: [{ quota_usage: quota, config: { quota_total: total } }] });
+        case "container": {
+          const v = uri("1000");
+          return res(v === null ? { id: "1000" } : { id: "1000", uri: v });
+        }
+        case "rupload":
+          return res({ success: true, message: "Upload successful." });
+        case "status": {
+          const s = status(c.caminho);
+          return res({ id: c.caminho, status_code: s, status: s === "ERROR" ? statusTexto : s });
+        }
+        case "publish":
+          return res({ id: "9001" });
+        case "permalink":
+          return res({ id: c.caminho, permalink: PERMALINK });
+        case "upload":
+        case "delete":
+          return res({});
+        default:
+          return res({ error: { message: "não mockado" } }, 400);
       }
-      if (url.endsWith("/api/midia/publicar")) return { ok: true, status: 200, json: async () => resposta };
-      return { ok: true, status: 200, json: async () => ({}) };
     });
-    const tipo = (c) =>
-      c.url.endsWith("/api/midia/publicar") ? "rota" : c.metodo === "DELETE" ? "delete" : c.metodo === "POST" ? "upload" : "?";
-    return { fetch, chamadas, tipos: () => chamadas.map(tipo) };
+    return { fetch, chamadas, tipos: () => chamadas.map((c) => c.tipo), de: (t) => chamadas.filter((c) => c.tipo === t) };
   }
-  const ehRota = (c) => c.url.endsWith("/api/midia/publicar");
-  const vars = (extra = {}) => (nome) => ({ PUBLICAR_SECRET: SEGREDO, MANYWATA_URL: "https://manywata.vercel.app", ...extra })[nome];
-  const rodar = (fetch, { argv = ["--confirmar"], alvo = arquivo, leg = ["--legenda", legenda], env = ENV_SB, lerVar = vars(), ffprobe = sonda(), ...resto } = {}) =>
+
+  const rodar = (fetch, { argv = ["--confirmar"], alvo = arquivo, leg = ["--legenda", legenda], env = ENV_IG, ffprobe = sonda(), ...resto } = {}) =>
     executar(["reels", alvo, ...leg, ...argv], {
       fetch,
       env,
-      lerVar,
+      // o reels não lê .env.local nem PUBLICAR_SECRET
+      lerVar: () => {
+        throw new Error("reels não deveria ler .env.local");
+      },
       agora: AGORA,
       sufixo: "a1b2c3",
       ffprobe,
@@ -2044,148 +2099,452 @@ describe("scripts/midia.mjs reels <arquivo.mp4>", () => {
       avisar: () => {},
       ...resto,
     });
+  const comCapa = (extra = []) => ["--capa", capa, "--confirmar", ...extra];
 
-  test("sem --confirmar: dry-run, zero fetch, mostra URL pública, tipo REELS e legenda", async () => {
-    const { fetch } = servidor();
+  // ── fluxo feliz ──
+
+  test("ordem e formato: cota → POST /media resumível (params exatos, sem video_url) → rupload (OAuth, offset 0, file_size, bytes) → FINISHED → media_publish", async () => {
+    const { fetch, chamadas, tipos } = igFalso();
     const linhas = [];
-    const r = await rodar(fetch, { argv: [], log: (l) => linhas.push(l) });
+    const r = await rodar(fetch, { log: (l) => linhas.push(l) });
+
+    expect(tipos()).toEqual(FELIZ);
+    expect(r).toMatchObject({ mediaId: "9001", permalink: PERMALINK, username: "eternizacards", tipo: "REELS", containerId: "1000", conta: "eterniza" });
+
+    // tudo no Graph com Bearer no header, nunca na query
+    for (const c of chamadas.filter((x) => x.tipo !== "rupload")) {
+      expect(c.url.startsWith("https://graph.instagram.com/v21.0/")).toBe(true);
+      expect(c.url).not.toContain("access_token");
+      expect(c.url).not.toContain(TOKEN);
+      expect(c.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    }
+
+    const container = chamadas[1];
+    expect(container.metodo).toBe("POST");
+    expect(container.url).toBe(`https://graph.instagram.com/v21.0/${USER}/media`);
+    expect(container.params).toEqual({ media_type: "REELS", upload_type: "resumable", caption: CAPTION });
+
+    const up = chamadas[2];
+    expect(up.url).toBe(URI);
+    expect(up.metodo).toBe("POST");
+    expect(up.headers).toEqual({ Authorization: `OAuth ${TOKEN}`, offset: "0", file_size: String(mp4Minimo().length) });
+    expect(Buffer.from(up.body).equals(mp4Minimo())).toBe(true);
+
+    expect(chamadas[3].caminho).toBe("1000");
+    expect(chamadas[4].params).toEqual({ creation_id: "1000" });
+
+    const saida = linhas.join("\n");
+    expect(saida).toContain(PERMALINK);
+    expect(saida).toMatch(/upload_type=resumable/);
+    expect(saida).not.toMatch(/instagram-temp/);
+  });
+
+  test("polling: IN_PROGRESS até FINISHED, sem publicar antes", async () => {
+    const rel = relogio();
+    let n = 0;
+    const { fetch, tipos } = igFalso({ status: () => (++n < 3 ? "IN_PROGRESS" : "FINISHED") });
+    await rodar(fetch, { sleep: rel.sleep, now: rel.now });
+    expect(tipos()).toEqual(["cota", "container", "rupload", "status", "status", "status", "publish", "permalink"]);
+  });
+
+  test("legenda vazia: o container vai sem caption", async () => {
+    writeFileSync(legenda, "  \n");
+    const { fetch, de } = igFalso();
+    await rodar(fetch);
+    expect(de("container")[0].params).toEqual({ media_type: "REELS", upload_type: "resumable" });
+  });
+
+  test("sem uri na resposta: monta https://rupload.facebook.com/ig-api-upload/v21.0/{id}", async () => {
+    const { fetch, de } = igFalso({ uri: () => null });
+    await rodar(fetch);
+    expect(de("rupload")[0].url).toBe(URI);
+  });
+
+  test("usa a uri devolvida pelo Instagram (mesmo host, outro caminho)", async () => {
+    const outra = "https://rupload.facebook.com/ig-api-upload/v22.0/1000?x=1";
+    const { fetch, de } = igFalso({ uri: () => outra });
+    await rodar(fetch);
+    expect(de("rupload")[0].url).toBe(outra);
+  });
+
+  test.each([
+    ["host estranho", "https://evil.example.com/ig-api-upload/v21.0/1000"],
+    ["subdomínio parecido", "https://rupload.facebook.com.evil.example/ig-api-upload/v21.0/1000"],
+    ["http", "http://rupload.facebook.com/ig-api-upload/v21.0/1000"],
+    ["caminho fora de /ig-api-upload/", "https://rupload.facebook.com/outra-coisa/1000"],
+    ["com usuário", "https://x:y@rupload.facebook.com/ig-api-upload/v21.0/1000"],
+    ["não é URL", "nada a ver"],
+  ])("uri de %s → recusa, não manda vídeo nem token pra lá, nada publicado", async (_n, uri) => {
+    const { fetch, tipos } = igFalso({ uri: () => uri });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(/uri de upload fora de https:\/\/rupload\.facebook\.com\/ig-api-upload\//);
+    expect(e.message).toMatch(/Nada foi publicado/);
+    expect(e.message).not.toMatch(/INDEFINIDO/);
+    expect(e.message).not.toContain(TOKEN);
+    expect(tipos()).toEqual(["cota", "container"]);
+  });
+
+  test(".mov passa pelo mesmo caminho", async () => {
+    const mov = join(raiz, "clip.MOV");
+    writeFileSync(mov, mp4Minimo("qt"));
+    const { fetch, tipos } = igFalso();
+    await rodar(fetch, { alvo: mov });
+    expect(tipos()).toEqual(FELIZ);
+  });
+
+  test("--conta watanabe: lê IG_ACCESS_TOKEN e usa o user id dela", async () => {
+    const { fetch, de } = igFalso();
+    const r = await rodar(fetch, { argv: ["--confirmar", "--conta", "watanabe"], env: { IG_ACCESS_TOKEN: TOKEN } });
+    expect(r.username).toBe("watanabe.ia");
+    expect(de("container")[0].url).toBe("https://graph.instagram.com/v21.0/17841400866194604/media");
+  });
+
+  test("--conta desconhecida → recusa sem rede", async () => {
+    const { fetch } = igFalso();
+    await expect(rodar(fetch, { argv: ["--confirmar", "--conta", "outra"] })).rejects.toThrow(/Conta "outra" desconhecida/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("MP4 > 8 MB e < 300 MB SEGUE (o vídeo não passa pelo bucket)", async () => {
+    const tamanho = 20 * 1024 * 1024;
+    const grande = esparso(tamanho);
+    const { fetch, tipos, de } = igFalso();
+    const r = await rodar(fetch, { alvo: grande });
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(FELIZ);
+    const up = de("rupload")[0];
+    expect(up.headers.file_size).toBe(String(tamanho));
+    expect(up.body.length).toBe(tamanho);
+  });
+
+  // ── --capa ──
+
+  test("--capa: sobe o JPEG (image/jpeg) no instagram-temp, manda cover_url, apaga depois; o MP4 não vai ao Storage", async () => {
+    const { fetch, chamadas, tipos, de } = igFalso();
+    const linhas = [];
+    const r = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO, log: (l) => linhas.push(l) });
+
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(FELIZ_CAPA);
+
+    const ups = de("upload");
+    expect(ups).toHaveLength(1);
+    expect(ups[0].url).toBe(`${SUPA}/storage/v1/object/instagram-temp/${CAMINHO_CAPA}`);
+    expect(ups[0].headers).toEqual({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE, "Content-Type": "image/jpeg", "x-upsert": "false" });
+    expect(Buffer.from(ups[0].body).equals(CAPA_BYTES)).toBe(true);
+    expect(ups[0].body.length).toBeLessThanOrEqual(MAX_BYTES);
+    // nada de vídeo no Storage
+    for (const c of chamadas.filter((x) => x.tipo === "upload" || x.tipo === "delete")) {
+      expect(c.url).not.toMatch(/\.mp4/i);
+      expect(String(c.headers["Content-Type"])).not.toMatch(/video/);
+    }
+
+    expect(de("container")[0].params).toEqual({ media_type: "REELS", upload_type: "resumable", caption: CAPTION, cover_url: PUBLICA_CAPA });
+    expect(validarUrlPublica(PUBLICA_CAPA)).toBe(PUBLICA_CAPA);
+
+    expect(JSON.parse(de("delete")[0].body).prefixes).toEqual([CAMINHO_CAPA]);
+    expect(linhas.join("\n")).toMatch(/Capa temporária apagada de instagram-temp\/drop-natal-reels-20261127-2130-a1b2c3\//);
+  });
+
+  test("--capa + media_publish falhou (indefinido): NÃO apaga o JPEG, mostra o limpar, não fala em apagar MP4", async () => {
+    const { fetch, tipos } = igFalso({ falha: (c) => (c.tipo === "publish" ? { status: 500, body: { error: { message: "An unknown error occurred" } } } : null) });
+    const e = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO }).catch((x) => x);
+    expect(e.indefinido).toBe(true);
+    expect(e.message).toMatch(/INDEFINIDO/);
+    expect(e.message).toMatch(/Confira o perfil @eternizacards/);
+    expect(e.message).toMatch(/capa NÃO foi apagada/);
+    expect(e.message).toContain(`instagram-temp/${CAMINHO_CAPA}`);
+    expect(e.message).toContain(`node scripts/midia.mjs limpar ${PREFIXO} --confirmar`);
+    expect(e.message).not.toMatch(/\.mp4/i);
+    expect(tipos()).toEqual(["cota", "upload", "container", "rupload", "status", "publish"]);
+  });
+
+  test.each([
+    ["rupload recusado (HTTP 400)", { falha: (c) => (c.tipo === "rupload" ? { status: 400, body: { debug_info: { type: "ProcessingFailedError", message: "Request processing failed" } } } : null) }, /rupload\.facebook\.com recusou o upload/],
+    ["rupload sem success: true", { falha: (c) => (c.tipo === "rupload" ? { status: 200, body: { success: false } } : null) }, /resposta sem success: true/],
+    ["status ERROR", { status: () => "ERROR" }, /falhou no Instagram \(ERROR\)/],
+    ["status EXPIRED", { status: () => "EXPIRED" }, /expirou/],
+  ])("--capa + erro definido (%s): apaga o JPEG, sem media_publish", async (_n, opcoes, msg) => {
+    const { fetch, tipos, de } = igFalso(opcoes);
+    const e = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO }).catch((x) => x);
+    expect(e.message).toMatch(msg);
+    expect(e.message).toMatch(/Nada foi publicado/i);
+    expect(e.indefinido).toBeUndefined();
+    expect(e.message).not.toMatch(/limpar/);
+    expect(tipos()).not.toContain("publish");
+    expect(tipos().at(-1)).toBe("delete");
+    expect(JSON.parse(de("delete")[0].body).prefixes).toEqual([CAMINHO_CAPA]);
+  });
+
+  test("--capa + cota cheia: nem sobe a capa", async () => {
+    const { fetch, tipos } = igFalso({ quota: 50 });
+    await expect(rodar(fetch, { argv: comCapa(), env: ENV_TUDO })).rejects.toThrow(/Limite de publicação de 24h atingido/);
+    expect(tipos()).toEqual(["cota"]);
+  });
+
+  test("--capa + Storage recusou o JPEG: definido, sem container, apaga o que tentou", async () => {
+    const { fetch, tipos } = igFalso({ falha: (c) => (c.tipo === "upload" ? { status: 413, body: { message: "Payload too large" } } : null) });
+    const e = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO }).catch((x) => x);
+    expect(e.message).toMatch(/Storage recusou drop-natal-reels\.jpg \(HTTP 413\)[\s\S]*Nada foi publicado/);
+    expect(tipos()).toEqual(["cota", "upload", "delete"]);
+  });
+
+  test("--capa: falha ao apagar depois do sucesso só avisa, com o limpar", async () => {
+    const { fetch } = igFalso({ falha: (c) => (c.tipo === "delete" ? { status: 500, body: { message: "boom" } } : null) });
+    const avisos = [];
+    const r = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO, avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(avisos.join("\n")).toMatch(/não consegui apagar a capa[\s\S]*limpar drop-natal-reels-20261127-2130-a1b2c3 --confirmar/);
+  });
+
+  test.each([
+    ["não é JPEG", () => writeFileSync(join(raiz, "capa.jpg"), Buffer.from("\x89PNG\r\n\x1a\n0000")), /--capa: capa\.jpg não é JPEG/],
+    ["> 8 MB", () => esparso(MAX_BYTES + 1, "capa.jpg", Buffer.from([0xff, 0xd8, 0xff, 0xe0])), /--capa: capa\.jpg tem 8\.0 MB; o limite do bucket é 8 MB/],
+    ["inexistente", () => rmSync(join(raiz, "capa.jpg")), /--capa: não consegui ler o arquivo/],
+  ])("--capa %s → recusa sem rede (dry-run e --confirmar)", async (_n, preparar, msg) => {
+    preparar();
+    const { fetch } = igFalso();
+    await expect(rodar(fetch, { argv: comCapa(), env: ENV_TUDO })).rejects.toThrow(msg);
+    await expect(rodar(fetch, { argv: ["--capa", capa] })).rejects.toThrow(msg);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("--capa sem arquivo → recusa sem rede", async () => {
+    const { fetch } = igFalso();
+    await expect(rodar(fetch, { argv: ["--capa", "--confirmar"], env: ENV_TUDO })).rejects.toThrow(/Falta o arquivo JPEG depois de --capa/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("JPEG de exatamente 8 MB na capa passa", async () => {
+    const f = esparso(MAX_BYTES, "capa.jpg", Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+    const { fetch, de } = igFalso();
+    await rodar(fetch, { argv: ["--capa", f, "--confirmar"], env: ENV_TUDO });
+    expect(de("upload")[0].body.length).toBe(MAX_BYTES);
+  });
+
+  // ── --thumb-offset ──
+
+  test("--thumb-offset 1500: thumb_offset no POST /media, zero Storage", async () => {
+    const { fetch, tipos, de } = igFalso();
+    const r = await rodar(fetch, { argv: ["--thumb-offset", "1500", "--confirmar"], env: ENV_TUDO });
+    expect(r.mediaId).toBe("9001");
+    expect(tipos()).toEqual(FELIZ);
+    expect(de("container")[0].params).toEqual({ media_type: "REELS", upload_type: "resumable", caption: CAPTION, thumb_offset: 1500 });
+  });
+
+  test("--thumb-offset 0 vai (zero é válido)", async () => {
+    const { fetch, de } = igFalso();
+    await rodar(fetch, { argv: ["--thumb-offset", "0", "--confirmar"] });
+    expect(de("container")[0].params.thumb_offset).toBe(0);
+  });
+
+  test.each([["-1"], ["1.5"], ["abc"], ["1e3"], [undefined]])("--thumb-offset %s → recusa sem rede", async (valor) => {
+    const { fetch } = igFalso();
+    const argv = valor === undefined ? ["--thumb-offset", "--confirmar"] : ["--thumb-offset", valor, "--confirmar"];
+    await expect(rodar(fetch, { argv })).rejects.toThrow(/--thumb-offset precisa ser um inteiro >= 0 em milissegundos/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("--thumb-offset além da duração só avisa", async () => {
+    const { fetch, de } = igFalso();
+    const avisos = [];
+    await rodar(fetch, { argv: ["--thumb-offset", "45000", "--confirmar"], avisar: (l) => avisos.push(l) });
+    expect(avisos.join("\n")).toMatch(/--thumb-offset 45000 ms passa da duração do vídeo \(30000 ms\)/);
+    expect(de("container")[0].params.thumb_offset).toBe(45000);
+  });
+
+  test("--capa e --thumb-offset juntos → recusa sem fetch (com e sem --confirmar)", async () => {
+    const { fetch } = igFalso();
+    const msg = /use --capa <arquivo\.jpg> OU --thumb-offset <ms>, não os dois/;
+    await expect(rodar(fetch, { argv: ["--capa", capa, "--thumb-offset", "1500", "--confirmar"], env: ENV_TUDO })).rejects.toThrow(msg);
+    await expect(rodar(fetch, { argv: ["--thumb-offset", "1500", "--capa", capa] })).rejects.toThrow(msg);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  // ── resultado definido x indefinido (sem capa) ──
+
+  test.each([
+    ["status ERROR", { status: () => "ERROR" }, /falhou no Instagram \(ERROR\)[\s\S]*limites do Reels/],
+    ["status EXPIRED", { status: () => "EXPIRED" }, /expirou no Instagram/],
+    ["rupload HTTP 400", { falha: (c) => (c.tipo === "rupload" ? { status: 400, body: { debug_info: { message: "Invalid file" } } } : null) }, /recusou o upload do vídeo \(HTTP 400\): Invalid file/],
+    ["rupload sem JSON", { falha: (c) => (c.tipo === "rupload" ? { status: 502 } : null) }, /recusou o upload do vídeo \(HTTP 502\)/],
+    ["rupload falha de rede", { falha: (c) => (c.tipo === "rupload" ? new TypeError("fetch failed") : null) }, /falha de rede no upload do vídeo/],
+    ["rupload timeout", { falha: (c) => (c.tipo === "rupload" ? Object.assign(new Error("timeout"), { name: "TimeoutError" }) : null) }, /upload do vídeo pro rupload\.facebook\.com não terminou/],
+    ["container recusado (ex.: Instagram Login sem upload resumível)", { falha: (c) => (c.tipo === "container" ? { status: 400, body: { error: { message: "Invalid parameter" } } } : null) }, /Instagram recusou POST .*\/media: Invalid parameter/],
+  ])("%s → definido: nada publicado, sem media_publish", async (_n, opcoes, msg) => {
+    const { fetch, tipos } = igFalso(opcoes);
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(msg);
+    expect(e.message).toMatch(/Nada foi publicado/i);
+    expect(e.message).not.toMatch(/INDEFINIDO/);
+    expect(e.indefinido).toBeUndefined();
+    expect(tipos()).not.toContain("publish");
+  });
+
+  test("timeout do status (IN_PROGRESS pra sempre) → definido, sem media_publish", async () => {
+    const rel = relogio();
+    const { fetch, tipos } = igFalso({ status: () => "IN_PROGRESS" });
+    const e = await rodar(fetch, { sleep: rel.sleep, now: rel.now, timeoutStatusMs: 60_000 }).catch((x) => x);
+    expect(e.message).toMatch(/não ficou pronto em \d+s \(último status: IN_PROGRESS\)[\s\S]*Nada foi publicado/);
+    expect(e.indefinido).toBeUndefined();
+    expect(tipos()).not.toContain("publish");
+    expect(rel.t - T0).toBeGreaterThanOrEqual(60_000);
+  });
+
+  test("media_publish falhou → INDEFINIDO, confira o perfil, sem limpar (não tem MP4 no Storage)", async () => {
+    const { fetch, tipos } = igFalso({ falha: (c) => (c.tipo === "publish" ? new TypeError("fetch failed") : null) });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.indefinido).toBe(true);
+    expect(e.message).toMatch(/media_publish do container 1000 falhou/);
+    expect(e.message).toMatch(/INDEFINIDO/);
+    expect(e.message).toMatch(/Confira o perfil @eternizacards[\s\S]*ANTES de rodar de novo/);
+    expect(e.message).not.toMatch(/limpar/);
+    expect(e.message).not.toMatch(/instagram-temp/);
+    expect(tipos()).toEqual(["cota", "container", "rupload", "status", "publish"]);
+  });
+
+  test("permalink falhou depois de publicar: sucesso com aviso", async () => {
+    const { fetch } = igFalso({ falha: (c) => (c.tipo === "permalink" ? { status: 500, body: { error: { message: "x" } } } : null) });
+    const avisos = [];
+    const r = await rodar(fetch, { avisar: (l) => avisos.push(l) });
+    expect(r.mediaId).toBe("9001");
+    expect(r.aviso).toMatch(/não deu pra buscar o permalink/);
+    expect(avisos.join("\n")).toMatch(/permalink/);
+  });
+
+  test("cota cheia → não cria container", async () => {
+    const { fetch, tipos } = igFalso({ quota: 50, total: 50 });
+    const e = await rodar(fetch).catch((x) => x);
+    expect(e.message).toMatch(/Limite de publicação de 24h atingido em @eternizacards \(50\/50\)[\s\S]*Nada foi publicado/);
+    expect(tipos()).toEqual(["cota"]);
+  });
+
+  test("cota ilegível → falha fechada, não cria container", async () => {
+    const { fetch, tipos } = igFalso({ falha: (c) => (c.tipo === "cota" ? { status: 200, body: { data: [] } } : null) });
+    await expect(rodar(fetch)).rejects.toThrow(/não deu pra ler o limite/);
+    expect(tipos()).toEqual(["cota"]);
+  });
+
+  // ── dry-run ──
+
+  test("sem --confirmar: dry-run, zero fetch, mesmo sem token e sem Supabase", async () => {
+    const { fetch } = igFalso();
+    const linhas = [];
+    const r = await rodar(fetch, { argv: [], env: {}, log: (l) => linhas.push(l) });
     expect(r).toBeNull();
     expect(fetch).not.toHaveBeenCalled();
     const saida = linhas.join("\n");
     expect(saida).toMatch(/sem --confirmar: só mostrando/);
-    expect(saida).toContain(`instagram-temp/${CAMINHO}`);
-    expect(saida).toContain(PUBLICA);
-    expect(saida).toContain('"tipo": "REELS"');
-    expect(saida).toContain('"video_url"');
-    expect(saida).toContain("Drop de Natal chegou.");
-    expect(saida).toMatch(/subiria 1 arquivo\(s\)/);
-    expect(saida).not.toMatch(/JPEG\(s\)/);
+    expect(saida).toMatch(/media_type=REELS upload_type=resumable \+ caption/);
+    expect(saida).toMatch(/rupload\.facebook\.com, Authorization: OAuth, offset 0, file_size 64/);
+    expect(saida).toMatch(/capa: nenhuma \(o Instagram escolhe o frame\)/);
+    expect(saida).toContain("| Drop de Natal chegou. #tcg #eternizacards");
+    expect(saida).toMatch(/IG_ACCESS_TOKEN_ETERNIZA não está no ambiente/);
+    expect(saida).not.toMatch(/instagram-temp/);
+    expect(saida).not.toMatch(/SUPABASE/);
     expect(saida).toMatch(/30\.0s · 1080x1920 · 30 fps · vídeo h264/);
   });
 
-  test("--dry-run: zero fetch, mesmo com --confirmar", async () => {
-    const { fetch } = servidor();
+  test("--dry-run: zero fetch, mesmo com --confirmar e tudo configurado", async () => {
+    const { fetch } = igFalso();
     const linhas = [];
-    await expect(rodar(fetch, { argv: ["--confirmar", "--dry-run"], log: (l) => linhas.push(l) })).resolves.toBeNull();
+    await expect(rodar(fetch, { argv: ["--confirmar", "--dry-run"], env: ENV_TUDO, log: (l) => linhas.push(l) })).resolves.toBeNull();
     await expect(rodar(fetch, { argv: ["--dry-run"] })).resolves.toBeNull();
     expect(fetch).not.toHaveBeenCalled();
     expect(linhas.join("\n")).not.toMatch(/sem --confirmar/);
+    expect(linhas.join("\n")).not.toMatch(/não está no ambiente/);
   });
 
-  test("dry-run sem credenciais nem PUBLICAR_SECRET: zero fetch, só avisa", async () => {
-    const { fetch } = servidor();
+  test("dry-run com --capa sem Supabase nem token: valida o JPEG, mostra o caminho e o cover_url, zero fetch", async () => {
+    const { fetch } = igFalso();
     const linhas = [];
-    await rodar(fetch, { argv: [], env: {}, lerVar: vars({ PUBLICAR_SECRET: undefined }), log: (l) => linhas.push(l) });
+    await rodar(fetch, { argv: ["--capa", capa], env: {}, log: (l) => linhas.push(l) });
     expect(fetch).not.toHaveBeenCalled();
-    expect(linhas.join("\n")).toMatch(/ausentes[\s\S]*<SUPABASE_URL>\/storage/);
-  });
-
-  test("--confirmar: sobe com video/mp4, chama a rota com REELS + legenda e apaga depois", async () => {
-    const { fetch, chamadas, tipos } = servidor();
-    const linhas = [];
-    const r = await rodar(fetch, { log: (l) => linhas.push(l) });
-
-    expect(r.mediaId).toBe("9001");
-    expect(tipos()).toEqual(["upload", "rota", "delete"]);
-    const up = chamadas[0];
-    expect(up.url).toBe(`${SUPA}/storage/v1/object/instagram-temp/${CAMINHO}`);
-    expect(up.headers).toEqual({ Authorization: `Bearer ${CHAVE}`, apikey: CHAVE, "Content-Type": "video/mp4", "x-upsert": "false" });
-    expect(Buffer.from(up.body).equals(mp4Minimo())).toBe(true);
-
-    const rota = chamadas[1];
-    expect(rota.headers.Authorization).toBe(`Bearer ${SEGREDO}`);
-    expect(JSON.parse(rota.body)).toEqual({ conta: "eterniza", tipo: "REELS", itens: [{ video_url: PUBLICA }], legenda: LEG, confirmar: true });
-    // o corpo que o CLI manda passa na validação da rota
-    expect(TIPOS.REELS.validar(JSON.parse(rota.body)).itens).toEqual([PUBLICA]);
-
-    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
     const saida = linhas.join("\n");
-    expect(saida).toMatch(/Publicando reels \(1 vídeo\)/);
-    expect(saida).toMatch(/Subindo 1 arquivo\(s\)/);
-    expect(saida).toContain(respostaOk.permalink);
-    expect(saida).toMatch(/Temporários apagados/);
+    expect(saida).toContain(`instagram-temp/${CAMINHO_CAPA}`);
+    expect(saida).toContain(`cover_url: <SUPABASE_URL>/storage/v1/object/public/instagram-temp/${CAMINHO_CAPA}`);
+    expect(saida).toMatch(/\+ caption \+ cover_url/);
+    expect(saida).toMatch(/SUPABASE_URL\/SUPABASE_SERVICE_ROLE_KEY ausentes/);
+    expect(saida).toMatch(/IG_ACCESS_TOKEN_ETERNIZA não está no ambiente/);
+    expect(saida).toMatch(/apagaria instagram-temp\/drop-natal-reels-20261127-2130-a1b2c3\//);
+    expect(saida).not.toMatch(/\.mp4.*instagram-temp|instagram-temp\/\S*\.mp4/);
   });
 
-  test(".mov sobe como video/quicktime com extensão .mov", async () => {
-    const mov = join(raiz, "clip.MOV");
-    writeFileSync(mov, mp4Minimo("qt"));
-    const { fetch, chamadas } = servidor();
-    await rodar(fetch, { alvo: mov });
-    expect(chamadas[0].url).toMatch(/\/clip-20261127-2130-a1b2c3\/clip\.mov$/);
-    expect(chamadas[0].headers["Content-Type"]).toBe("video/quicktime");
+  test("dry-run com --capa e Supabase no ambiente: cover_url real, sem aviso, sem imprimir a chave", async () => {
+    const { fetch } = igFalso();
+    const linhas = [];
+    await rodar(fetch, { argv: ["--capa", capa, "--dry-run"], env: ENV_TUDO, log: (l) => linhas.push(l) });
+    expect(fetch).not.toHaveBeenCalled();
+    const saida = linhas.join("\n");
+    expect(saida).toContain(`cover_url: ${PUBLICA_CAPA}`);
+    expect(saida).not.toMatch(/ausentes/);
+    expect(saida).not.toContain(CHAVE);
+    expect(saida).not.toContain(TOKEN);
   });
 
-  test("--conta é repassada", async () => {
-    const { fetch, chamadas } = servidor();
-    await rodar(fetch, { argv: ["--confirmar", "--conta", "outra"] });
-    expect(JSON.parse(chamadas.find(ehRota).body).conta).toBe("outra");
+  test("dry-run com --thumb-offset: mostra thumb_offset, sem Storage", async () => {
+    const { fetch } = igFalso();
+    const linhas = [];
+    await rodar(fetch, { argv: ["--thumb-offset", "1500"], env: {}, log: (l) => linhas.push(l) });
+    expect(fetch).not.toHaveBeenCalled();
+    const saida = linhas.join("\n");
+    expect(saida).toMatch(/thumb_offset=1500/);
+    expect(saida).toMatch(/frame do vídeo em 1500 ms/);
+    expect(saida).not.toMatch(/instagram-temp|SUPABASE/);
   });
 
-  test.each([
-    ["504 da rota (publicado: false)", (c) => (ehRota(c) ? { status: 504, body: { erro: "container 1000 não ficou pronto em 270s (último status: IN_PROGRESS). Nada foi publicado.", publicado: false } } : null), /HTTP 504/],
-    ["falha de rede", (c) => (ehRota(c) ? new TypeError("fetch failed") : null), /Pode ter publicado mesmo assim/],
-    ["resposta sem JSON", (c) => (ehRota(c) ? { status: 502, body: null } : null), /sem detalhe/],
-    ["erro sem publicado: false", (c) => (ehRota(c) ? { status: 502, body: { erro: "Instagram recusou POST media_publish" } } : null), /não confirmou se publicou/],
-  ])("%s → NÃO apaga e mostra o limpar", async (_n, falha, msg) => {
-    const { fetch, tipos } = servidor({ falha });
-    const e = await rodar(fetch).catch((x) => x);
-    expect(e.message).toMatch(msg);
-    expect(e.message).toMatch(/temporários NÃO foram apagados/);
-    expect(e.message).toContain(`instagram-temp/${CAMINHO}`);
-    expect(e.message).toContain(`node scripts/midia.mjs limpar ${PREFIXO} --confirmar`);
-    expect(tipos()).toEqual(["upload", "rota"]);
+  // ── recusas sem rede ──
+
+  test("--confirmar sem token: recusa sem fetch, cita IG_ACCESS_TOKEN_ETERNIZA", async () => {
+    const { fetch } = igFalso();
+    const env = { IG_ACCESS_TOKEN: "outro-token-de-outra-conta-123456", ...ENV_SB };
+    const e = await rodar(fetch, { env }).catch((x) => x);
+    expect(e.message).toMatch(/^Recusado: IG_ACCESS_TOKEN_ETERNIZA não está no ambiente/);
+    expect(e.message).toMatch(/nunca do \.env\.local/);
+    expect(e.message).not.toContain("outro-token-de-outra-conta-123456");
+    await expect(rodar(fetch, { env: { IG_ACCESS_TOKEN_ETERNIZA: "   " } })).rejects.toThrow(/IG_ACCESS_TOKEN_ETERNIZA/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("erro da rota {erro, publicado: false} (não 504) → apaga", async () => {
-    const { fetch, chamadas, tipos } = servidor({
-      falha: (c) => (ehRota(c) ? { status: 502, body: { erro: "container 1000 falhou no Instagram (ERROR)", publicado: false } } : null),
-    });
-    await expect(rodar(fetch)).rejects.toThrow(/HTTP 502[\s\S]*Nada foi publicado/);
-    expect(tipos()).toEqual(["upload", "rota", "delete"]);
-    expect(JSON.parse(chamadas[2].body).prefixes).toEqual([CAMINHO]);
+  test("--confirmar com --capa sem SUPABASE_*: recusa sem fetch (sem sugerir --base-url)", async () => {
+    const { fetch } = igFalso();
+    const e = await rodar(fetch, { argv: comCapa(), env: ENV_IG }).catch((x) => x);
+    expect(e.message).toMatch(/^Recusado: --capa sobe o JPEG pro instagram-temp/);
+    expect(e.message).toMatch(/SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY/);
+    expect(e.message).toMatch(/--thumb-offset/);
+    expect(e.message).not.toMatch(/--base-url/);
+    await expect(rodar(fetch, { argv: comCapa(), env: { ...ENV_IG, SUPABASE_URL: SUPA } })).rejects.toThrow(/SUPABASE_SERVICE_ROLE_KEY/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("--base-url: só chama a rota, com <base>/<nome do arquivo>, sem Storage", async () => {
-    const { fetch, chamadas, tipos } = servidor();
-    const r = await rodar(fetch, { argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/rl"] });
-    expect(r.mediaId).toBe("9001");
-    expect(tipos()).toEqual(["rota"]);
-    expect(JSON.parse(chamadas[0].body)).toEqual({
-      conta: "eterniza",
-      tipo: "REELS",
-      itens: [{ video_url: "https://cdn.exemplo.com/rl/Drop%20Natal%20Reels.mp4" }],
-      legenda: LEG,
-      confirmar: true,
-    });
+  test("sem --capa não exige Supabase", async () => {
+    const { fetch, tipos } = igFalso();
+    await rodar(fetch, { env: ENV_IG });
+    expect(tipos()).toEqual(FELIZ);
   });
 
-  test("--base-url com vídeo > 8 MB: o limite do bucket não se aplica", async () => {
-    const grande = esparso(MAX_BYTES + 1);
-    const { fetch, tipos } = servidor();
-    await rodar(fetch, { alvo: grande, argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/rl"] });
-    expect(tipos()).toEqual(["rota"]);
+  test("--base-url no reels → recusa sem rede (com e sem --confirmar)", async () => {
+    const { fetch } = igFalso();
+    await expect(rodar(fetch, { argv: ["--confirmar", "--base-url", "https://cdn.exemplo.com/rl"], env: ENV_TUDO })).rejects.toThrow(/reels não usa mais --base-url/);
+    await expect(rodar(fetch, { argv: ["--base-url", "https://cdn.exemplo.com/rl"] })).rejects.toThrow(/--base-url/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("falta --legenda / legenda inexistente → recusa sem rede", async () => {
-    const { fetch } = servidor();
+  test("falta --legenda / legenda inexistente / acima do limite → recusa sem rede", async () => {
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { leg: [] })).rejects.toThrow(/Falta --legenda <arquivo\.txt>/);
     await expect(rodar(fetch, { leg: [], argv: [] })).rejects.toThrow(/Falta --legenda/);
     await expect(rodar(fetch, { leg: ["--legenda", join(raiz, "nao-existe.txt")] })).rejects.toThrow(/Não consegui ler a legenda/);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  test("legenda acima do limite do Instagram → recusa sem rede", async () => {
     writeFileSync(legenda, "a".repeat(2201));
-    const { fetch } = servidor();
     await expect(rodar(fetch)).rejects.toThrow(/2201 caracteres/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
   test("arquivo inexistente / diretório / sem arquivo → recusa sem rede", async () => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { alvo: join(raiz, "nao-existe.mp4") })).rejects.toThrow(/Não consegui ler o arquivo/);
     await expect(rodar(fetch, { alvo: raiz })).rejects.toThrow(/Não consegui ler o arquivo/);
-    await expect(executar(["reels", "--confirmar"], { fetch, lerVar: vars() })).rejects.toThrow(/Falta o arquivo MP4/);
+    await expect(executar(["reels", "--confirmar"], { fetch, env: ENV_IG })).rejects.toThrow(/Falta o arquivo MP4/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -2194,10 +2553,10 @@ describe("scripts/midia.mjs reels <arquivo.mp4>", () => {
     ["arquivo vazio", "x.mp4", () => Buffer.alloc(0), /não tem a assinatura ftyp/],
     ["extensão .avi", "x.avi", () => mp4Minimo(), /não é MP4 \(extensão \.avi/],
     ["extensão .jpg", "x.jpg", () => mp4Minimo(), /não é MP4 \(extensão \.jpg/],
-  ])("%s → recusa sem rede e sem ffprobe", async (_n, nome, bytes, msg) => {
+  ])("não-mp4 (%s) → recusa sem rede e sem ffprobe", async (_n, nome, bytes, msg) => {
     const f = join(raiz, nome);
     writeFileSync(f, bytes());
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     const ffprobe = sonda();
     await expect(rodar(fetch, { alvo: f, ffprobe })).rejects.toThrow(msg);
     await expect(rodar(fetch, { alvo: f, ffprobe, argv: [] })).rejects.toThrow(msg);
@@ -2209,159 +2568,156 @@ describe("scripts/midia.mjs reels <arquivo.mp4>", () => {
     ["2,9s", 2.9, /2\.9s; o Instagram aceita Reels de 3s a 15min/],
     ["15min01s", 901, /15min01s; o Instagram aceita Reels de 3s a 15min/],
   ])("duração %s (ffprobe) → recusa sem rede, inclusive no dry-run", async (_n, duracao, msg) => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { ffprobe: sonda({ duracao }) })).rejects.toThrow(msg);
     await expect(rodar(fetch, { ffprobe: sonda({ duracao }), argv: [] })).rejects.toThrow(msg);
     expect(fetch).not.toHaveBeenCalled();
   });
 
   test.each([3, 900])("duração %is (limite exato) passa", async (duracao) => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { ffprobe: sonda({ duracao }) })).resolves.toMatchObject({ mediaId: "9001" });
   });
 
   test("container que o ffprobe não reconhece como mp4/mov → recusa sem rede", async () => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { ffprobe: sonda({ formato: "matroska,webm" }) })).rejects.toThrow(/container é "matroska,webm"/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("> 300 MB → recusa sem rede (limite do Instagram)", async () => {
+  test("> 300 MB → recusa sem rede (limite do Instagram), dry-run também", async () => {
     const enorme = esparso(300 * 1024 * 1024 + 1);
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     await expect(rodar(fetch, { alvo: enorme })).rejects.toThrow(/limite do Instagram pra Reels é 300 MB/);
     await expect(rodar(fetch, { alvo: enorme, argv: [] })).rejects.toThrow(/300 MB/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("> 8 MB com --confirmar → recusa antes de qualquer rede, falando do bucket", async () => {
-    const grande = esparso(MAX_BYTES + 1);
-    const { fetch } = servidor();
-    const e = await rodar(fetch, { alvo: grande }).catch((x) => x);
-    expect(e.message).toMatch(/^Recusado:/);
-    expect(e.message).toMatch(/bucket instagram-temp hoje aceita só image\/jpeg até 8 MB/);
-    expect(e.message).toMatch(/TUS/);
-    expect(e.message).toMatch(/ok do Vinicius/);
-    expect(e.message).toMatch(/Nada foi enviado/);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  test("> 8 MB com --confirmar mas sem SUPABASE_*: a mensagem é a do bucket, não a das credenciais", async () => {
-    const grande = esparso(MAX_BYTES + 1);
-    const { fetch } = servidor();
-    await expect(rodar(fetch, { alvo: grande, env: {} })).rejects.toThrow(/bucket instagram-temp/);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  test("dry-run de um MP4 de 50.653.437 bytes (válido pro Instagram): zero fetch, avisa o bucket e o teto Free, mostra o payload", async () => {
+  test("dry-run de 50.653.437 bytes: sem aviso de bucket (o MP4 não vai pro Storage)", async () => {
     const grande = esparso(50_653_437);
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     const linhas = [];
     const avisos = [];
-    const r = await rodar(fetch, { alvo: grande, argv: [], log: (l) => linhas.push(l), avisar: (l) => avisos.push(l) });
-    expect(r).toBeNull();
+    await rodar(fetch, { alvo: grande, argv: [], log: (l) => linhas.push(l), avisar: (l) => avisos.push(l) });
     expect(fetch).not.toHaveBeenCalled();
-    const aviso = avisos.join("\n");
-    expect(aviso).toMatch(/48,31 MiB \(50,65 MB, 50\.653\.437 bytes\)/);
-    expect(aviso).toMatch(/hoje aceita só image\/jpeg até 8 MB: o Storage vai recusar/);
-    expect(aviso).toMatch(/TUS \(upload resumível\) não resolve/);
-    expect(aviso).toMatch(/ok do Vinicius/);
-    expect(aviso).toMatch(/50\.000\.000 bytes[\s\S]*reencode/);
-    expect(aviso).not.toMatch(/Pro/);
-    const saida = linhas.join("\n");
-    expect(saida).toContain('"tipo": "REELS"');
-    expect(saida).toContain(PUBLICA);
+    expect(avisos).toEqual([]);
+    expect(linhas.join("\n")).toMatch(/file_size 50653437/);
+    expect(linhas.join("\n")).not.toMatch(/bucket|8 MB/);
   });
 
-  test("MP4 entre 8 MB e 50.000.000 bytes: avisa o bucket, mas não fala em reencodar", async () => {
-    const grande = esparso(20 * 1024 * 1024);
-    const { fetch } = servidor();
-    const avisos = [];
-    await rodar(fetch, { alvo: grande, argv: ["--dry-run"], avisar: (l) => avisos.push(l) });
-    expect(avisos.join("\n")).toMatch(/Storage vai recusar/);
-    expect(avisos.join("\n")).not.toMatch(/reencode/);
-  });
+  // ── ffprobe (só avisos) ──
 
   test("sem ffprobe: avisa que a duração não foi conferida e segue", async () => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     const avisos = [];
     const r = await rodar(fetch, { ffprobe: () => null, avisar: (l) => avisos.push(l) });
     expect(r.mediaId).toBe("9001");
     expect(avisos.join("\n")).toMatch(/ffprobe não encontrado[\s\S]*duração[\s\S]*NÃO foram conferidos/);
   });
 
-  test("ffprobe falhou ao ler: avisa e segue", async () => {
-    const { fetch } = servidor();
-    const avisos = [];
-    await rodar(fetch, { argv: [], ffprobe: () => ({ erro: "moov atom not found" }), avisar: (l) => avisos.push(l) });
-    expect(avisos.join("\n")).toMatch(/moov atom not found/);
-  });
-
-  test("recomendações fora do ideal só avisam (9:16, largura, fps, codecs, bitrates)", async () => {
-    const { fetch, tipos } = servidor();
+  test("recomendações fora do ideal só avisam", async () => {
+    const { fetch, tipos } = igFalso();
     const avisos = [];
     const ffprobe = sonda({ w: 3840, h: 2160, fps: "120/1", vcodec: "vp9", acodec: "opus", vbps: 40_000_000, abps: 256_000 });
     const r = await rodar(fetch, { ffprobe, avisar: (l) => avisos.push(l) });
     expect(r.mediaId).toBe("9001");
-    expect(tipos()).toEqual(["upload", "rota", "delete"]);
+    expect(tipos()).toEqual(FELIZ);
     const a = avisos.join("\n");
-    expect(a).toMatch(/3840x2160; o recomendado pra Reels é 9:16 \(1080x1920\)/);
-    expect(a).toMatch(/largura 3840 passa de 1920/);
-    expect(a).toMatch(/120 fps; o recomendado é de 23 a 60/);
+    expect(a).toMatch(/3840x2160; o recomendado pra Reels é 9:16/);
+    expect(a).toMatch(/120 fps/);
     expect(a).toMatch(/codec de vídeo vp9/);
-    expect(a).toMatch(/codec de áudio opus/);
-    expect(a).toMatch(/40\.0 Mbps; o recomendado é até 25 Mbps/);
-    expect(a).toMatch(/256 kbps; o recomendado é até 128 kbps/);
   });
 
   test("1080x1920 h264/aac 30fps: nenhum aviso", async () => {
-    const { fetch } = servidor();
+    const { fetch } = igFalso();
     const avisos = [];
     await rodar(fetch, { avisar: (l) => avisos.push(l) });
     expect(avisos).toEqual([]);
   });
 
-  test("vídeo gravado em pé (1920x1080 com rotação 90) conta como 1080x1920", async () => {
-    const { fetch } = servidor();
-    const avisos = [];
-    const ffprobe = vi.fn(() => ({
-      format: { format_name: "mov,mp4,m4a,3gp,3g2,mj2", duration: "12" },
-      streams: [{ codec_type: "video", codec_name: "hevc", width: 1920, height: 1080, avg_frame_rate: "30000/1001", side_data_list: [{ rotation: -90 }] }],
-    }));
-    await rodar(fetch, { argv: [], ffprobe, avisar: (l) => avisos.push(l) });
-    expect(avisos).toEqual([]);
+  // ── segredos ──
+
+  test("token (literal, OAuth, Bearer, access_token) e chave do Supabase nunca aparecem em log ou erro, mesmo com eco", async () => {
+    const eco = `Invalid OAuth access token ${TOKEN} | Authorization: OAuth ${TOKEN} | Bearer ${TOKEN} | ?access_token=${TOKEN} | chave ${CHAVE}`;
+    const ecoSemLiteral = "Authorization: OAuth IGQVJdesconhecido987654321 Bearer IGQVJoutro123456789 ?access_token=IGQVJmais999";
+    const saida = [];
+    const coletar = (l) => saida.push(String(l));
+    const erroCom = (m) => ({ status: 400, body: { error: { message: m }, debug_info: { message: m }, message: m } });
+    const casos = [
+      { falha: (c) => (c.tipo === "container" ? erroCom(eco) : null) },
+      { falha: (c) => (c.tipo === "rupload" ? erroCom(eco) : null) },
+      { falha: (c) => (c.tipo === "rupload" ? erroCom(ecoSemLiteral) : null) },
+      { falha: (c) => (c.tipo === "rupload" ? new TypeError(eco) : null) },
+      { status: () => "ERROR", statusTexto: eco },
+      { falha: (c) => (c.tipo === "publish" ? erroCom(eco) : null) },
+      { falha: (c) => (c.tipo === "permalink" ? erroCom(eco) : null) },
+      { falha: (c) => (c.tipo === "upload" ? { status: 403, body: { message: eco } } : null) },
+      { falha: (c) => (c.tipo === "delete" ? { status: 500, body: { message: eco } } : null) },
+      { falha: (c) => (c.tipo === "cota" ? new TypeError(eco) : null) },
+    ];
+    for (const caso of casos) {
+      const { fetch } = igFalso(caso);
+      const r = await rodar(fetch, { argv: comCapa(), env: ENV_TUDO, log: coletar, avisar: coletar }).catch((x) => x);
+      if (r instanceof Error) saida.push(r.message);
+      else saida.push(JSON.stringify(r));
+    }
+    await rodar(igFalso().fetch, { argv: ["--capa", capa], env: ENV_TUDO, log: coletar, avisar: coletar }); // dry-run
+    const tudo = saida.join("\n");
+    expect(tudo).toMatch(/OAuth \[oculto\]/); // houve eco de verdade, e foi mascarado
+    expect(tudo).toMatch(/Invalid OAuth access token/); // mensagem do Meta preservada
+    expect(tudo).not.toContain(TOKEN);
+    expect(tudo).not.toContain(CHAVE);
+    expect(tudo).not.toContain("IGQVJdesconhecido987654321");
+    expect(tudo).not.toContain("IGQVJoutro123456789");
+    expect(tudo).not.toContain("IGQVJmais999");
+  });
+});
+
+// ── criarContainerResumivel / enviarVideoResumivel (lib) ──────────────────
+
+describe("criarContainerResumivel e enviarVideoResumivel", () => {
+  function graphFalso(resposta = { id: "77", uri: "https://rupload.facebook.com/ig-api-upload/v21.0/77" }) {
+    const chamadas = [];
+    const fetch = vi.fn(async (url, init = {}) => {
+      chamadas.push({ url, init, params: init.body && typeof init.body === "string" ? JSON.parse(init.body) : undefined });
+      return { ok: true, status: 200, json: async () => resposta };
+    });
+    return { fetch, chamadas };
+  }
+
+  test("só inclui caption / cover_url / thumb_offset quando vêm", async () => {
+    const casos = [
+      [{}, { media_type: "REELS", upload_type: "resumable" }],
+      [{ legenda: "oi" }, { media_type: "REELS", upload_type: "resumable", caption: "oi" }],
+      [{ coverUrl: "https://cdn.exemplo.com/c.jpg" }, { media_type: "REELS", upload_type: "resumable", cover_url: "https://cdn.exemplo.com/c.jpg" }],
+      [{ thumbOffset: 0 }, { media_type: "REELS", upload_type: "resumable", thumb_offset: 0 }],
+      [{ legenda: "", coverUrl: undefined, thumbOffset: undefined }, { media_type: "REELS", upload_type: "resumable" }],
+    ];
+    for (const [entrada, esperado] of casos) {
+      const { fetch, chamadas } = graphFalso();
+      const pub = criarPublicador({ userId: USER, token: TOKEN, fetch });
+      await expect(pub.criarContainerResumivel(entrada)).resolves.toEqual({ id: "77", uri: "https://rupload.facebook.com/ig-api-upload/v21.0/77" });
+      expect(chamadas[0].params).toEqual(esperado);
+      expect(chamadas[0].params).not.toHaveProperty("video_url");
+    }
   });
 
-  test("sem SUPABASE_* ou sem PUBLICAR_SECRET com --confirmar → recusa e zero fetch", async () => {
-    const { fetch } = servidor();
-    await expect(rodar(fetch, { env: {} })).rejects.toThrow(/SUPABASE_URL/);
-    await expect(rodar(fetch, { lerVar: vars({ PUBLICAR_SECRET: undefined }) })).rejects.toThrow(/PUBLICAR_SECRET/);
+  test("recusa cover_url + thumb_offset, offset inválido e cover_url não pública, sem rede", async () => {
+    const { fetch } = graphFalso();
+    const pub = criarPublicador({ userId: USER, token: TOKEN, fetch });
+    await expect(pub.criarContainerResumivel({ coverUrl: "https://cdn.exemplo.com/c.jpg", thumbOffset: 10 })).rejects.toThrow(/não os dois/);
+    await expect(pub.criarContainerResumivel({ thumbOffset: -1 })).rejects.toThrow(/inteiro >= 0/);
+    await expect(pub.criarContainerResumivel({ thumbOffset: 1.5 })).rejects.toThrow(/inteiro >= 0/);
+    await expect(pub.criarContainerResumivel({ coverUrl: "http://localhost/c.jpg" })).rejects.toThrow(/cover_url/);
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("a chave do Supabase e o PUBLICAR_SECRET nunca aparecem em log ou erro, mesmo com o servidor ecoando", async () => {
-    const eco = `chave ${CHAVE} segredo ${SEGREDO}`;
-    const saida = [];
-    const coletar = (l) => saida.push(String(l));
-    const casos = [
-      { falha: (c) => (ehRota(c) ? { status: 400, body: { erro: eco, publicado: false } } : null) },
-      { falha: (c) => (ehRota(c) ? { status: 504, body: { erro: eco, publicado: false } } : null) },
-      { falha: (c) => (ehRota(c) ? new TypeError(eco) : null) },
-      { falha: (c) => (!ehRota(c) && c.metodo === "POST" ? { status: 403, body: { message: eco } } : null) },
-      { falha: (c) => (c.metodo === "DELETE" ? { status: 500, body: { message: eco } } : null) },
-    ];
-    for (const caso of casos) {
-      const { fetch } = servidor(caso);
-      const e = await rodar(fetch, { log: coletar, avisar: coletar }).catch((x) => x);
-      if (e instanceof Error) saida.push(e.message);
-    }
-    // dry-run com tudo configurado também não imprime credencial
-    await rodar(servidor().fetch, { argv: [], log: coletar, avisar: coletar });
-    const tudo = saida.join("\n");
-    expect(tudo).toMatch(/HTTP 400/); // houve saída de erro de verdade
-    expect(tudo).toMatch(/HTTP 403/);
-    expect(tudo).not.toContain(CHAVE);
-    expect(tudo).not.toContain(SEGREDO);
+  test("enviarVideoResumivel recusa uri fora do rupload sem rede", async () => {
+    const { fetch } = graphFalso();
+    const pub = criarPublicador({ userId: USER, token: TOKEN, fetch });
+    await expect(pub.enviarVideoResumivel("https://evil.example.com/ig-api-upload/x", { corpo: Buffer.alloc(1), tamanho: 1 })).rejects.toThrow(/uri de upload recusada/);
+    await expect(pub.enviarVideoResumivel("https://rupload.facebook.com/ig-api-upload/x", { corpo: Buffer.alloc(1), tamanho: 0 })).rejects.toThrow(/tamanho/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 

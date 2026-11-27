@@ -69,7 +69,7 @@ npm test
 
 Cobre o cadastro de contas e o casamento de regras. Os testes de invariante existem pra pegar o pior bug possível aqui: duas contas apontando pro mesmo token, o que faria o DM de uma sair pela outra em silêncio.
 
-`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro. Stories: params exatos do container (`image_url` + `media_type: "STORIES"`, sem `caption`), 1 item só, legenda recusada, não-JPEG, 503/401/`confirmar` sem fetch, cota cheia sem container, story sem permalink → 200 sem aviso, story de vídeo → 501, alias do carrossel recusando `STORIES` e `REELS`, o subcomando `story` do CLI (upload de 1 arquivo, limpeza, 504 mantém o arquivo, `--dry-run`, aviso de dimensões) e a leitura de largura x altura do JPEG. Reels: params exatos do container (`media_type: "REELS"` + `video_url` + `caption`; `cover_url`/`share_to_feed` só quando enviados), `video_url` ou `url` `.mp4`/`.mov`/`.m4v`, 0/2 itens, JPEG, `http`, IP privado e `share_to_feed` não booleano → 400 sem fetch, `ERROR`/`EXPIRED`/timeout sem `media_publish`, orçamento de 270s, cota cheia, permalink ausente → 200 com aviso; e o subcomando `reels` do CLI com `ffprobe` falso e MP4 mínimo (só o box `ftyp`; tamanhos grandes com arquivo esparso): dry-run sem `--confirmar` e com `--dry-run` sem nenhum fetch, upload `video/mp4`, limpeza igual, recusa sem rede (sem `--legenda`, não-MP4, duração fora de 3s–15min, > 300 MB, > 8 MB do bucket no `--confirmar`), aviso do bucket no dry-run, recomendações que só avisam e que chave/segredo não aparecem na saída.
+`tests/midia.test.js` cobre a publicação de mídia com `fetch` falso (nunca chama o Instagram): autenticação, `confirmar`, validação, limite de 24h antes de criar container, ordem das chamadas ao Graph, status `ERROR`/timeout, permalink que falha depois de publicar, o CLI e que o token não aparece em resposta nem em log. Usa um relógio falso com agenda (esperas em paralelo andam juntas, ninguém espera de verdade) pra cobrir: carrossel de 9 slides com cada `POST /media` levando 6s, filhos criados em paralelo com `children` na ordem certa mesmo com respostas fora de ordem, `aguardarStatus` com orçamento 0/negativo (checa e espera o mínimo), mensagem de timeout com o tempo real, `publicado: false` e o `vercel.json` batendo com `api/_lib/tempos.js`. Também cobre a hospedagem no Supabase Storage (`scripts/_storage.mjs`) com `fetch` falso: ordem e headers do upload, URLs públicas passadas à rota, recusa sem `SUPABASE_*` / arquivo não-JPEG / > 8 MB antes de subir qualquer coisa, limpeza só quando o resultado é definido (sucesso, erro com `publicado: false`, upload parcial), temporários mantidos quando é indefinido (504, rede, timeout do CLI, resposta sem detalhe), o subcomando `limpar`, `--base-url` e `--dry-run` sem Storage, e que a service role key nunca aparece em saída nem em erro. Stories: params exatos do container (`image_url` + `media_type: "STORIES"`, sem `caption`), 1 item só, legenda recusada, não-JPEG, 503/401/`confirmar` sem fetch, cota cheia sem container, story sem permalink → 200 sem aviso, story de vídeo → 501, alias do carrossel recusando `STORIES` e `REELS`, o subcomando `story` do CLI (upload de 1 arquivo, limpeza, 504 mantém o arquivo, `--dry-run`, aviso de dimensões) e a leitura de largura x altura do JPEG. Reels: params exatos do container (`media_type: "REELS"` + `video_url` + `caption`; `cover_url`/`share_to_feed` só quando enviados), `video_url` ou `url` `.mp4`/`.mov`/`.m4v`, 0/2 itens, JPEG, `http`, IP privado e `share_to_feed` não booleano → 400 sem fetch, `ERROR`/`EXPIRED`/timeout sem `media_publish`, orçamento de 270s, cota cheia, permalink ausente → 200 com aviso; e o subcomando `reels` do CLI (direto com o Instagram) com `fetch`, `ffprobe` e relógio falsos e MP4 mínimo (só o box `ftyp`; tamanhos grandes com arquivo esparso): ordem cota → `POST /media` resumível (params exatos, sem `video_url`) → rupload (`Authorization: OAuth`, `offset: 0`, `file_size`, corpo = bytes) → `FINISHED` → `media_publish`; `uri` da resposta, `uri` montada quando não vem e `uri` de host estranho recusada; `--capa` (upload `image/jpeg`, `cover_url`, apaga no definido, mantém e mostra o `limpar` no indefinido, MP4 nunca no Storage), `--thumb-offset`, os dois juntos recusados; `ERROR`/`EXPIRED`/timeout/rupload falho definidos sem publish; `media_publish` falho indefinido; dry-run sem nenhum fetch mesmo sem token e sem `SUPABASE_*`; recusas sem rede (sem token, `--capa` sem `SUPABASE_*`, `--base-url`, JPEG inválido/> 8 MB, não-MP4, duração, > 300 MB); MP4 > 8 MB seguindo; e que token (literal, `Bearer`, `OAuth`, `access_token=`) e chave do Supabase não aparecem na saída.
 
 ## Insights orgânicos
 
@@ -86,7 +86,7 @@ Se der 401: o cron rotacionou o token na Vercel, recopie pro `.env.local`.
 
 ## Publicação de mídia
 
-Publica no Instagram pela API oficial (Instagram API with Instagram Login), **numa chamada só**. Hoje: **carrossel**, **story de imagem** (ver [Stories](#stories)) e **Reels** (ver [Reels](#reels), com ressalvas de tempo e de hospedagem) da @eternizacards. Story de vídeo já tem lugar no desenho, mas responde 501 (ver [o que falta](#o-que-falta-para-stories-de-vídeo)).
+Publica no Instagram pela API oficial (Instagram API with Instagram Login), **numa chamada só**. Hoje: **carrossel**, **story de imagem** (ver [Stories](#stories)) e **Reels** (ver [Reels](#reels): pelo CLI o vídeo vai direto pro upload resumível do Instagram, sem passar pela rota) da @eternizacards. Story de vídeo já tem lugar no desenho, mas responde 501 (ver [o que falta](#o-que-falta-para-stories-de-vídeo)).
 
 ### Fluxo de negócio
 
@@ -191,16 +191,17 @@ node scripts/midia.mjs publicar carrossel/drop-natal/render --base-url https://e
 node scripts/midia.mjs story carrossel/drop-natal/story.jpg --confirmar --dry-run
 node scripts/midia.mjs story carrossel/drop-natal/story.jpg --confirmar
 
-# Reels de 1 vídeo (ver "Reels" abaixo). Sem --confirmar é dry-run.
-node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt
-node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --confirmar
+# Reels de 1 vídeo, direto pro upload resumível do Instagram (ver "Reels" abaixo).
+# Sem --confirmar é dry-run. Token só do ambiente (IG_ACCESS_TOKEN_ETERNIZA).
+node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --capa reels/capa.jpg
+node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --capa reels/capa.jpg --confirmar
 
 # apagar os temporários de uma publicação de resultado indefinido (depois de conferir o perfil)
 node scripts/midia.mjs limpar drop-natal-20261115-0105-a1b2c3 --confirmar
 ```
 
 - Lê `slide-NN.jpg` da pasta em ordem numérica (`slide-2` antes de `slide-10`) e a legenda de `instagram-post.txt` na mesma pasta.
-- **Sem `--confirmar` ele recusa**, inclusive com `--dry-run`. Exceção: `reels` sem `--confirmar` faz dry-run (ver [Reels](#reels)).
+- **Sem `--confirmar` ele recusa**, inclusive com `--dry-run`. Exceção: `reels` sem `--confirmar` faz dry-run, e o `reels` não chama a rota nem aceita `--base-url` (ver [Reels](#reels)).
 - `--conta` padrão: `eterniza`.
 - A chamada à rota pode levar **alguns minutos** (até 300s). O CLI espera até 330s e desiste (resultado indefinido, ver abaixo).
 - **Sem `--base-url`** (padrão): sobe os JPEGs pro Supabase Storage, publica e apaga **quando o resultado é definido** (ver [hospedagem](#hospedagem-das-imagens)).
@@ -245,13 +246,23 @@ node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--bas
 
 ### Reels
 
-Reels de **um vídeo**, pela mesma rota (`POST /api/midia/publicar`, `"tipo": "REELS"`) e pelo mesmo fluxo: `confirmar: true`, cota de 24h antes de criar o container, container `FINISHED`, `media_publish`, permalink. O alias `/api/carrossel/publicar` continua **só** carrossel (Reels lá dá 400).
+Reels de **um vídeo**. Tem dois caminhos, e **o CLI não usa a rota**:
 
-**Na rota:**
+| | Rota `POST /api/midia/publicar` (`tipo: "REELS"`) | CLI `midia.mjs reels` |
+|---|---|---|
+| Vídeo | `video_url` já hospedado numa URL https pública (o Meta baixa) | arquivo local, mandado **direto pro upload resumível do Instagram** (`rupload.facebook.com`) |
+| Passa pela Vercel? | sim, só o JSON pequeno | **não** (a função da Vercel aceita no máximo 4,5 MB de request; o MP4 tem 16–48 MB) |
+| Passa pelo Supabase? | não | **o MP4 não**. Só a capa JPEG, se vier `--capa` |
+| Token | `IG_ACCESS_TOKEN_ETERNIZA` na Vercel | `IG_ACCESS_TOKEN_ETERNIZA` **no ambiente do terminal** do operador |
+
+O alias `/api/carrossel/publicar` continua **só** carrossel (Reels lá dá 400).
+
+**Na rota** (continua existindo, pra quem já tem o vídeo numa URL):
 - **Exatamente 1 item**, URL https pública: `itens[0].video_url` (o caminho pode não ter extensão, mas se tiver precisa ser de vídeo) **ou** `itens[0].url` terminando em `.mp4`/`.mov`/`.m4v` (maiúscula ou minúscula). JPEG/imagem, item sem URL, `http`, `localhost`/IP privado → **400** sem tocar no Instagram.
 - `legenda`: mesmas regras do carrossel (2200 caracteres, 30 hashtags, 20 menções). Vazia ou ausente → o container vai **sem** `caption`.
 - `cover_url` (opcional, no corpo): capa em JPEG público. `share_to_feed` (opcional): **booleano estrito** (`"true"`, `1`, `null` → 400). Só entram nos params do container quando vêm no corpo.
 - Container `ERROR` (502) ou `EXPIRED` (410) abortam **sem** `media_publish` (`publicado: false`). A mensagem do `ERROR` lembra os limites do Reels.
+- **Tempo**: uma chamada só, com 300s de `maxDuration`; 270s esperando o container ficar `FINISHED`. Vídeo pesado pode dar **504** sem publicar.
 
 ```bash
 curl -sX POST https://manywata.vercel.app/api/midia/publicar \
@@ -260,40 +271,62 @@ curl -sX POST https://manywata.vercel.app/api/midia/publicar \
 # → 200 {"mediaId": "...", "permalink": "https://www.instagram.com/reel/...", ..., "tipo": "REELS"}
 ```
 
-⚠️ **Ressalvas (leia antes de publicar vídeo):**
-- **Tempo.** A rota continua sendo **uma chamada só** (como carrossel e story), com 300s de `maxDuration` (plano Hobby). O Reels usa 270s esperando o container ficar `FINISHED`. Vídeo longo ou pesado **pode não ficar pronto a tempo**: a rota responde **504** sem publicar e o CLI mantém o arquivo no bucket (resultado indefinido; o Instagram pode seguir processando o container). Dividir em duas chamadas (cria o container / checa e publica) é outro desenho e **não entra agora**.
-- **Hospedagem.** O bucket `instagram-temp` **hoje aceita só `image/jpeg` até 8 MB**. Então, pelo Storage, o upload de vídeo vai ser recusado. O CLI sabe disso: no `--confirmar` ele **recusa antes de qualquer rede** se o MP4 passa de 8 MB, e no dry-run só avisa. Liberar `video/mp4` e subir o limite de arquivo do bucket (no máximo até o teto do plano Free, **50 MB**) **depende do ok do Vinicius** e não gera custo de plano. Atenção: o teto Free pode ser 50.000.000 bytes ou 50 MiB. O vídeo de ~50,65 MB (**50.653.437 bytes**, ~48,31 MiB) cabe se for 50 MiB, mas **não cabe** se for 50.000.000 bytes, mesmo depois de ajustar o bucket. Nesse caso, reencode um pouco menor. Enquanto isso, `--base-url` com o vídeo já numa URL https pública funciona.
-- **TUS** (upload resumível) **não entra** e não contorna o limite do bucket (o limite é do bucket, não do jeito de subir). O CLI usa o upload padrão (um `POST`), sem dependência nova. Se o bucket for ampliado no futuro, arquivos > 6 MB sobem de forma mais confiável por TUS, mas o `POST` padrão da API do Storage aceita até o limite do plano.
-
-**CLI:**
+**CLI** (o jeito normal de publicar Reels):
 
 ```bash
-node scripts/midia.mjs reels <arquivo.mp4> --legenda <arquivo.txt> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
-npm run midia:reels -- reels/drop-natal.mp4 --legenda reels/drop-natal.txt
+# token da conta, do arquivo protegido (só no terminal do operador)
+set -a; . <arquivo-com-o-token>; set +a          # define IG_ACCESS_TOKEN_ETERNIZA
+# só se for usar --capa:
+set -a; . /home/box/.secrets/supabase-eterniza.env; set +a
+
+node scripts/midia.mjs reels <arquivo.mp4> --legenda <arquivo.txt> [--capa <arquivo.jpg> | --thumb-offset <ms>] --confirmar [--conta eterniza] [--dry-run]
+
+# exemplos
+node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --capa reels/capa.jpg              # dry-run
+node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --capa reels/capa.jpg --confirmar  # publica
+node scripts/midia.mjs reels reels/drop-natal.mp4 --legenda reels/drop-natal.txt --thumb-offset 1500 --confirmar
 ```
 
-- **Sem `--confirmar` não recusa: faz dry-run** (diferente de `publicar`/`story`). Valida o vídeo, mostra o caminho no bucket, a URL pública e o corpo que mandaria, e **não chama rede nenhuma** (nem Storage, nem a rota). `--dry-run` faz o mesmo, com ou sem `--confirmar`. Não exige `SUPABASE_*` nem `PUBLICAR_SECRET` (só avisa se faltarem).
-- Só **`--confirmar` sem `--dry-run`** publica.
-- **`--legenda <arquivo.txt>` é obrigatório** (não procura `instagram-post.txt` sozinho). A legenda passa pelas mesmas regras da rota antes de qualquer rede.
-- **Validação local, antes de qualquer rede** (`scripts/_video.mjs`):
-  - bloqueia: arquivo inexistente ou que não é arquivo; extensão diferente de `.mp4`/`.mov`/`.m4v`; sem a assinatura `ftyp` de MP4/MOV; **mais de 300 MB** (limite do Instagram pra Reels);
-  - com **`ffprobe`** no `PATH` (só usa se existir; o CLI não instala nada): bloqueia **duração fora de 3s a 15min**, container que não é mp4/mov e arquivo sem faixa de vídeo; **avisa** (não bloqueia) o que é recomendação: proporção diferente de 9:16 (1080x1920 é o típico; vídeo gravado em pé com rotação conta certo), largura > 1920, fps fora de 23–60, vídeo que não é H.264/HEVC, áudio que não é AAC, vídeo > 25 Mbps, áudio > 128 kbps;
-  - **sem `ffprobe`**: confere existência, tamanho e assinatura e **avisa** que a duração não foi conferida, sem bloquear.
-- Sem `--base-url`: sobe pra `instagram-temp/<nome-do-arquivo-sanitizado>-<AAAAMMDD-HHMM>-<aleatório>/<nome-do-arquivo-sanitizado>.mp4` com `Content-Type: video/mp4` (`.mov` sobe como `video/quicktime`), chama a rota com `tipo: "REELS"`, `itens: [{"video_url": ...}]` e a legenda, e segue **a mesma regra de limpeza** do carrossel e do story ([tabela](#hospedagem-das-imagens)). Hoje, com o bucket em 8 MB / só JPEG, um MP4 > 8 MB é recusado aqui, antes de qualquer rede, com a explicação acima.
-- Com `--base-url`: a URL é `<--base-url>/<nome-do-arquivo>`; não sobe nem apaga nada, e o limite do bucket não se aplica.
-- O log diz `Publicando reels (1 vídeo)`.
+O que o `--confirmar` faz, nesta ordem:
 
-Exemplo do aviso no dry-run de um MP4 de 50.653.437 bytes:
+1. **Cota de 24h** (`content_publishing_limit`). Cheia ou ilegível → para, nenhum container criado.
+2. Só com `--capa`: **sobe o JPEG** da capa pro `instagram-temp` (ver abaixo).
+3. **Container resumível**: `POST graph.instagram.com/v21.0/{ig-user-id}/media` (token no header `Authorization: Bearer`, nunca na URL) com `media_type=REELS`, `upload_type=resumable`, `caption` (se houver) e `cover_url` **ou** `thumb_offset` (se vierem). **Sem `video_url`.** A resposta traz `id` e `uri`.
+4. **Upload do MP4**: um `POST` só na `uri` devolvida, com `Authorization: OAuth <token>`, `offset: 0`, `file_size: <bytes>` e o binário no corpo. A `uri` só é aceita se for `https://rupload.facebook.com/ig-api-upload/...` (o token vai junto: nunca mandamos pra outro host). Se o Meta não devolver `uri`, o CLI monta `https://rupload.facebook.com/ig-api-upload/v21.0/{id}`. Timeout do upload: 10 min.
+5. **Polling** do `status_code` até `FINISHED` (até 10 min). `ERROR` ou `EXPIRED` abortam **sem** `media_publish`.
+6. **`media_publish`** e permalink.
 
-```
-aviso: drop.mp4 tem 48,31 MiB (50,65 MB, 50.653.437 bytes). O bucket instagram-temp hoje aceita só image/jpeg até 8 MB: o Storage vai recusar este upload.
-  - TUS (upload resumível) não resolve: o limite é do bucket, não do jeito de subir.
-  - Liberar video/mp4 e subir o limite de arquivo do bucket (no máximo até o teto do plano Free, 50 MB) depende do ok do Vinicius. Não muda o plano nem gera custo.
-  - Se o teto Free for 50.000.000 bytes (e não 50 MiB), este arquivo não cabe nem depois de ajustar o bucket: reencode o vídeo um pouco menor.
-  - Alternativa: --base-url com o vídeo já numa URL https pública.
-```
+Os 10 min são do CLI, na máquina do operador (`CLI_RUPLOAD_TIMEOUT_MS` e `CLI_REELS_STATUS_TIMEOUT_MS` em `api/_lib/tempos.js`). O `MAX_DURATION_S` e o `vercel.json` não mudam: o CLI não passa pela função.
 
-Com `--confirmar`, a mesma mensagem vem como erro (`Recusado: ...` + `Nada foi enviado.`).
+**Capa (opcional, uma OU outra):**
+- **`--capa <arquivo.jpg>`**: mesma checagem do story/carrossel antes de qualquer rede (começa com `FF D8 FF`, **até 8 MB**). Sobe pelo mesmo caminho do carrossel/story (`image/jpeg`, `x-upsert: false`) pra `instagram-temp/<slug-do-vídeo>-<AAAAMMDD-HHMM>-<aleatório>/<slug-do-vídeo>.jpg`, e a URL pública vai no container como `cover_url`. Precisa de `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` **no ambiente** (só com `--confirmar`; mesmo carregamento das outras).
+- **`--thumb-offset <ms>`**: sem upload. Inteiro ≥ 0, em milissegundos, que vai como `thumb_offset` (o frame do próprio vídeo naquele instante). Se o ffprobe disser que o vídeo é mais curto, só avisa.
+- **As duas juntas: recusa**, sem rede (com `cover_url` o Instagram ignora o `thumb_offset`, então mandar as duas só confunde).
+- **Nenhuma**: o Instagram escolhe o frame.
+- Sem `--capa`, o CLI **não exige nem toca no Supabase**.
+
+**Resultado e limpeza:**
+
+| Onde parou | Resultado | Capa no bucket (`--capa`) |
+|---|---|---|
+| Validação local, cota, upload da capa, container recusado, `uri` estranha, rupload recusado/sem `success: true`/falha de rede/timeout, `ERROR`, `EXPIRED`, timeout do status | **definido**: nada publicado | **apaga** |
+| Publicou (`media_id`) | **definido** | **apaga** |
+| `media_publish` chamado e falhou/sem resposta | **INDEFINIDO**: confira o perfil, **não republique no escuro** | **mantém** e mostra `node scripts/midia.mjs limpar <prefixo> --confirmar` |
+
+O MP4 **nunca** vai pro Storage, então não tem vídeo pra apagar em caso nenhum. O container que não foi publicado não aparece no perfil e o Instagram descarta sozinho.
+
+**Token:** o CLI lê **só do ambiente**, pela env da conta em `api/contas.js` (`--conta eterniza` → `IG_ACCESS_TOKEN_ETERNIZA`; `--conta watanabe` → `IG_ACCESS_TOKEN`). Nunca do `.env.local`, nunca de argumento (vazaria no histórico e no `ps`), nunca impresso. Faltando com `--confirmar` → recusa citando o **nome** da env, sem rede. Toda mensagem passa por `sanitizar()`, que tira o token literal, `access_token=...`, `Bearer ...` e `OAuth ...`. O `reels` não usa `PUBLICAR_SECRET` nem `MANYWATA_URL`.
+
+**Dry-run:** **sem `--confirmar` não recusa, faz dry-run** (diferente de `publicar`/`story`); `--dry-run` faz o mesmo, com ou sem `--confirmar`. Valida legenda, vídeo e (se vier) o JPEG da capa, mostra a conta, o tamanho, a caption, o caminho que a capa teria no bucket e o `cover_url` (ou o `thumb_offset`) e os passos acima, com **zero fetch**. Não exige o token nem as `SUPABASE_*` (só avisa se faltarem).
+
+**Validação local, antes de qualquer rede** (`scripts/_video.mjs`):
+- **`--legenda <arquivo.txt>` é obrigatório** (não procura `instagram-post.txt` sozinho) e passa pelas regras da rota.
+- bloqueia: arquivo inexistente ou que não é arquivo; extensão diferente de `.mp4`/`.mov`/`.m4v`; sem a assinatura `ftyp` de MP4/MOV; **mais de 300 MB** (limite do Instagram pra Reels). **Não tem limite de 8 MB pro vídeo**: isso é do bucket, e o vídeo não passa por ele;
+- com **`ffprobe`** no `PATH` (só usa se existir; o CLI não instala nada): bloqueia **duração fora de 3s a 15min**, container que não é mp4/mov e arquivo sem faixa de vídeo; **avisa** (não bloqueia) o que é recomendação: proporção diferente de 9:16 (vídeo gravado em pé com rotação conta certo), largura > 1920, fps fora de 23–60, vídeo que não é H.264/HEVC, áudio que não é AAC, vídeo > 25 Mbps, áudio > 128 kbps;
+- **sem `ffprobe`**: confere existência, tamanho e assinatura e **avisa** que a duração não foi conferida, sem bloquear.
+- **`--base-url` no `reels` é recusado** (era do fluxo antigo, com o vídeo hospedado). Quem já tem o vídeo numa URL usa a rota direto.
+
+⚠️ **Risco conhecido: Instagram Login x upload resumível.** O MANYWATA usa **Instagram API with Instagram Login** (`graph.instagram.com`, token `IGAA...`). A documentação da Meta descreve o upload resumível (`upload_type=resumable` + `rupload.facebook.com`) na parte de **Facebook Login for Business**. Implementamos mesmo assim, de propósito, e **não mudamos o app pra Facebook Login**. Se a Meta recusar (no `POST /media` com `upload_type=resumable` ou no rupload), o CLI para com o erro **sanitizado**, **nada é publicado** e a capa (se subiu) é apagada. Nesse caso a alternativa é hospedar o vídeo numa URL https pública e usar a rota com `video_url`.
 
 ### Hospedagem das imagens
 
@@ -301,7 +334,7 @@ Quem baixa as imagens é o **servidor do Meta**, não a rota. Então cada slide 
 
 **Solução: bucket `instagram-temp` no Supabase do eternizacards**, usado só durante a publicação.
 
-- Bucket **público** (o Meta precisa baixar sem login), aceita só `image/jpeg`, máximo 8 MB por arquivo (`MAX_BYTES` em `scripts/_storage.mjs`). Vídeo do Reels **não passa** hoje; mudar isso (liberar `video/mp4`, subir o limite até no máximo os 50 MB do Free) depende do ok do Vinicius, e aí se atualiza `MAX_BYTES` junto (ver [Reels](#reels)).
+- Bucket **público** (o Meta precisa baixar sem login), aceita só `image/jpeg`, máximo 8 MB por arquivo (`MAX_BYTES` em `scripts/_storage.mjs`). Serve pros slides, pro story e pra **capa do Reels** (`--capa`). O **vídeo** do Reels não passa por aqui: o CLI manda direto pro upload resumível do Instagram (ver [Reels](#reels)), então o bucket não precisa mudar.
 - Plano Free do Supabase: **sem custo** dentro de 1 GB de armazenamento e 5 GB de tráfego por mês. Como os arquivos são apagados logo depois de publicar, o armazenamento fica perto de zero; o tráfego é basicamente o download do Meta (um carrossel de 10 slides de ~500 KB ≈ 5 MB).
 - Quem sobe e apaga é o **CLI, na máquina do operador**. A rota na Vercel não sabe do Supabase, e as `SUPABASE_*` **não vão pra Vercel**.
 
@@ -344,7 +377,7 @@ Se **apagar falhar**, o publish continua valendo (código de saída 0) e o CLI i
 | Var | Onde | Tipo | Observação |
 |-----|------|------|------------|
 | `PUBLICAR_SECRET` | **a criar**: Vercel (production) + `.env.local` de quem usa o CLI | **Sensitive** serve, ninguém precisa ler de volta | mínimo 32 caracteres: `openssl rand -hex 32`. Sem ela a rota responde 503 |
-| `IG_ACCESS_TOKEN_ETERNIZA` | já existe, **só no target production** | Encrypted | em deploy de preview a rota responde 503 ("token não configurado"), então **preview da Vercel não publica**. Pra testar de ponta a ponta tem que ser em produção |
+| `IG_ACCESS_TOKEN_ETERNIZA` | já existe, **só no target production** | Encrypted | em deploy de preview a rota responde 503 ("token não configurado"), então **preview da Vercel não publica**. Pra testar de ponta a ponta tem que ser em produção. O CLI `reels` lê a mesma env **do ambiente do terminal** (carregada de um arquivo protegido; nunca `.env.local`, nunca argv) |
 | `MANYWATA_URL` | só `.env.local` (CLI) | — | opcional |
 | `SUPABASE_URL` | **só no ambiente local do operador**, carregada de `/home/box/.secrets/supabase-eterniza.env`. **Não na Vercel**, não no `.env.local` | — | `https://<projeto>.supabase.co` do eternizacards |
 | `SUPABASE_SERVICE_ROLE_KEY` | idem | — | passa por cima de RLS: nunca em argv, log ou chat. Só o CLI usa, pra subir/apagar no `instagram-temp` |
@@ -365,16 +398,16 @@ Depois de criar: **`vercel --prod` de novo**.
 - `api/_lib/` não vira rota na Vercel (prefixo `_`). Lá ficam `seguranca.js` (auth, sanitização, validação de URL), `instagram-publicacao.js` (cliente do Graph com `fetch`/`sleep`/`now` injetáveis + registro `TIPOS`) e `rotas-midia.js` (a rota).
 - **Sem banco nem store** na rota: cada chamada é independente. O único armazenamento é o bucket temporário que o CLI usa (`scripts/_storage.mjs`: `lerCredenciaisStorage`, `lerSlidesJpeg`, `enviarParaStorage`, `listarDoStorage`, `apagarDoStorage`, todos com `fetch` injetável).
 - Tempo: a função tem 300s (`vercel.json`); os containers têm até 240s (Reels: 270s); o resto fica pro `media_publish` e o permalink (ver [Limites de tempo](#limites-de-tempo)). Filhos são criados e esperados em paralelo (`emParalelo` em `instagram-publicacao.js`), então 9 slides levam o tempo do slide mais lento, não a soma.
-- O token vai no header `Authorization: Bearer`, nunca na URL. Toda mensagem de erro e de log passa por `sanitizar()`, que tira `access_token=`, `Bearer ...` e os segredos conhecidos.
+- O token vai no header `Authorization: Bearer`, nunca na URL (no upload do Reels pelo CLI, `Authorization: OAuth` pro `rupload.facebook.com`). Toda mensagem de erro e de log passa por `sanitizar()`, que tira `access_token=`, `Bearer ...`, `OAuth ...` e os segredos conhecidos.
 
 ### O que falta para Stories de vídeo
 
 O registro `TIPOS` em `api/_lib/instagram-publicacao.js` tem `CAROUSEL`, `REELS` e `STORIES` (só imagem) implementados. O story de vídeo é recusado com 501 dentro do `validar()` de `STORIES`.
 
 **Reels ✅ pronto na rota e no CLI** (ver [Reels](#reels)), com o que ainda fica de fora:
-1. **Tempo**: continua uma chamada só, com 270s de espera dentro dos 300s da função. Vídeo que demora mais pra ficar `FINISHED` dá 504. A saída é dividir em duas chamadas (uma cria o container e devolve o id, outra checa o status e publica quando estiver `FINISHED`), mantendo `confirmar: true` e a checagem de cota antes de criar. Não foi feito.
-2. **Hospedagem**: o bucket `instagram-temp` segue em `image/jpeg` até 8 MB. Pra subir vídeo pelo Storage falta o ok do Vinicius pra liberar `video/mp4` e subir o limite (até no máximo os 50 MB do Free, sem custo de plano); depois disso, atualizar `MAX_BYTES` em `scripts/_storage.mjs`.
-3. **TUS**: não implementado (e não precisa enquanto o bucket for ≤ 8 MB). Vale considerar se o limite subir, pra arquivos > 6 MB.
+1. **Tempo na rota**: continua uma chamada só, com 270s de espera dentro dos 300s da função; vídeo que demora mais dá 504. O CLI não tem esse limite (fala direto com o Meta, até 10 min de upload e 10 min de status).
+2. **Upload resumível com Instagram Login**: implementado, mas a doc da Meta descreve pra Facebook Login for Business (ver o risco em [Reels](#reels)). Confirmar no primeiro uso real.
+3. **Retomada do upload** (`offset` > 0 depois de queda): não implementada; o CLI manda o MP4 inteiro num `POST` só. Se cair, é definido (nada publicado) e roda de novo.
 
 **Stories: imagem ✅ pronto** (ver [Stories](#stories)). 1 JPEG, sem legenda (400 se vier), `criarContainer({ image_url, media_type: "STORIES" })`, permalink opcional (`permalinkOpcional: true` no registro).
 
@@ -382,7 +415,7 @@ O registro `TIPOS` em `api/_lib/instagram-publicacao.js` tem `CAROUSEL`, `REELS`
 1. `validar()`: hoje item com `video_url` ou URL `.mp4`/`.mov`/`.m4v` → 501. Trocar por: aceitar 1 `video_url` https (MP4/MOV), nunca junto com imagem, ainda sem legenda.
 2. `criarContainers()`: `criarContainer({ media_type: "STORIES", video_url })`.
 3. **Tempo**: o mesmo do Reels. Processar vídeo pode passar dos 300s da função; dá pra reaproveitar o orçamento do Reels, mas o certo é o fluxo em duas chamadas (cria o container / checa e publica).
-4. Hospedagem: o mesmo do Reels (bucket só aceita `image/jpeg` até 8 MB). O CLI `story` também só aceita JPEG hoje; a validação de vídeo do `reels` (`scripts/_video.mjs`) pode ser reaproveitada.
+4. Hospedagem: o bucket só aceita `image/jpeg` até 8 MB; o caminho natural é o mesmo upload resumível do `reels` (sem bucket). O CLI `story` também só aceita JPEG hoje; a validação de vídeo do `reels` (`scripts/_video.mjs`) pode ser reaproveitada.
 5. Limites do Meta pra vídeo em story (duração, tamanho): conferir na doc na hora de implementar.
 
 **Pendências gerais**

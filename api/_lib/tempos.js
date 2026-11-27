@@ -40,3 +40,13 @@ export const STATUS_INTERVALO_MAX_MS = 5_000;
 
 // Timeout do fetch do CLI pra rota. Tem que ser > MAX_DURATION_S.
 export const CLI_TIMEOUT_ROTA_MS = 330_000;
+
+// Reels pelo CLI (`midia.mjs reels`): o CLI fala direto com o Meta, na
+// máquina do operador, sem passar pela função da Vercel. Então NÃO fica preso
+// aos 300s do MAX_DURATION_S:
+//   CLI_RUPLOAD_TIMEOUT_MS        quanto o POST do vídeo pro rupload pode levar
+//                                 (48 MB numa conexão de ~1 Mbps ≈ 6,5 min)
+//   CLI_REELS_STATUS_TIMEOUT_MS   quanto o CLI espera o container ficar
+//                                 FINISHED depois do upload
+export const CLI_RUPLOAD_TIMEOUT_MS = 600_000;
+export const CLI_REELS_STATUS_TIMEOUT_MS = 600_000;

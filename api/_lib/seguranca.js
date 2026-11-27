@@ -69,8 +69,11 @@ export function autenticar(req, env = process.env) {
 
 // Tira token de qualquer texto que vá pra resposta ou pro log. Os segredos
 // conhecidos (token da conta, PUBLICAR_SECRET) são trocados literalmente, e
-// access_token=... / Bearer ... por padrão, caso venha um que a gente não
-// conhece (ex.: uma URL ecoada pelo Graph numa mensagem de erro).
+// access_token=... / Bearer ... / OAuth ... por padrão, caso venha um que a
+// gente não conhece (ex.: uma URL ou um header ecoado pelo Graph ou pelo
+// rupload numa mensagem de erro). "OAuth" só conta seguido de algo com cara
+// de token (8+ caracteres sem espaço), pra não comer "Invalid OAuth access
+// token" das mensagens do Meta.
 export function sanitizar(texto, segredos = []) {
   let s = String(texto ?? "");
   for (const segredo of segredos) {
@@ -78,7 +81,8 @@ export function sanitizar(texto, segredos = []) {
   }
   return s
     .replace(/access_token=[^&\s"'<>]+/gi, "access_token=[oculto]")
-    .replace(/Bearer\s+[^\s"',]+/gi, "Bearer [oculto]");
+    .replace(/Bearer\s+[^\s"',]+/gi, "Bearer [oculto]")
+    .replace(/\bOAuth\s+(?!\[oculto\])[^\s"',;)}\]]{8,}/gi, "OAuth [oculto]");
 }
 
 // ── URLs públicas ─────────────────────────────────────────────────────────
