@@ -1,13 +1,16 @@
-// CLI pra publicar um carrossel ou um story aprovado. Fala com POST
+// CLI pra publicar um carrossel, um story ou um Reels aprovado. Fala com POST
 // /api/midia/publicar do MANYWATA (não com o Instagram direto).
 //
 // Uso:
 //   node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
 //   node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
+//   node scripts/midia.mjs reels <arquivo.mp4> --legenda <arquivo.txt> --confirmar [--conta eterniza] [--base-url <url>] [--dry-run]
 //   node scripts/midia.mjs limpar <prefixo> --confirmar
 //
-// Só rode o publicar/story com o ok do Vinicius nas imagens e no texto: a
-// chamada publica direto, não tem rascunho. Sem --confirmar o CLI recusa.
+// Só rode o publicar/story/reels com o ok do Vinicius na mídia e no texto: a
+// chamada publica direto, não tem rascunho. publicar e story sem --confirmar
+// recusam. reels sem --confirmar NÃO recusa: vira dry-run (valida o vídeo,
+// mostra o que faria e não chama rede nenhuma).
 //
 // A pasta de render tem slide-01.jpg, slide-02.jpg, ... (ordem numérica,
 // slide-2 antes de slide-10) e instagram-post.txt com a legenda.
@@ -17,6 +20,17 @@
 // instagram-temp/<slug-do-arquivo>-<carimbo>/<slug-do-arquivo>.jpg e segue
 // a mesma regra de limpeza abaixo. Com --base-url a URL é
 // <base-url>/<nome-do-arquivo>.
+//
+// reels: 1 vídeo MP4 (ou MOV) + --legenda <arquivo.txt> (obrigatório; não
+// procura instagram-post.txt sozinho). Antes de qualquer rede: assinatura
+// ftyp, até 300 MB e, com ffprobe no PATH, duração de 3s a 15min e container
+// mp4/mov (bloqueia); 9:16, fps, codec e bitrate só avisam (scripts/_video.mjs).
+// Sem ffprobe, avisa que a duração não foi conferida e segue. Sobe pra
+// instagram-temp/<slug-do-arquivo>-<carimbo>/<slug>.mp4 (video/mp4) e chama a
+// rota com tipo REELS. O bucket hoje só aceita JPEG até 8 MB: vídeo > 8 MB é
+// recusado antes de qualquer rede no --confirmar (no dry-run só avisa), até o
+// bucket ser ajustado com o ok do Vinicius (ver MAX_BYTES em _storage.mjs).
+// Com --base-url a URL é <base-url>/<nome-do-arquivo>.
 //
 // Quem baixa as imagens é o servidor do Meta, então elas precisam estar numa
 // URL https pública:
@@ -44,6 +58,7 @@
 //       node scripts/midia.mjs limpar <prefixo> --confirmar
 //
 // --dry-run: mostra o que mandaria (e os caminhos no Storage) e não chama nada.
+// No reels, --dry-run ou falta de --confirmar dão o mesmo dry-run.
 //
 // Lê PUBLICAR_SECRET e MANYWATA_URL do ambiente ou do .env.local. Nunca
 // imprime segredo nem chave.
@@ -52,9 +67,11 @@ import { readFileSync, readdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { sanitizar } from "../api/_lib/seguranca.js";
+import { validarLegenda } from "../api/_lib/instagram-publicacao.js";
 import { CLI_TIMEOUT_ROTA_MS, MAX_DURATION_S } from "../api/_lib/tempos.js";
 import {
   BUCKET,
+  MAX_BYTES,
   apagarDoStorage,
   carimbo,
   dimensoesJpeg,
@@ -62,12 +79,14 @@ import {
   lerCredenciaisStorage,
   lerSlidesJpeg,
   listarDoStorage,
+  mensagemLimiteBucket,
   montarCaminhos,
   normalizarPrefixo,
   sanitizarSlug,
   slugDaPasta,
   urlPublica,
 } from "./_storage.mjs";
+import { ffprobePadrao, validarVideoReels } from "./_video.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const URL_PADRAO = "https://manywata.vercel.app";
@@ -75,6 +94,7 @@ const ROTA = "/api/midia/publicar";
 const USO = [
   "Uso: node scripts/midia.mjs publicar <pasta-render> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]",
   "     node scripts/midia.mjs story <arquivo.jpg> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]",
+  "     node scripts/midia.mjs reels <arquivo.mp4> --legenda <arquivo.txt> --confirmar [--conta eterniza] [--base-url <url-https-pública>] [--dry-run]",
   "     node scripts/midia.mjs limpar <prefixo> --confirmar",
 ].join("\n");
 const CONFERIR = "confira o perfil ANTES de rodar de novo.";
@@ -122,7 +142,7 @@ function lerVarPadrao(nome) {
 
 // Lança Error com a mensagem pro usuário; o bootstrap lá embaixo imprime e
 // sai com 1. Injeção (fetch, lerVar, env, log, avisar, agora, sufixo,
-// timeoutRotaMs) é pros testes. SUPABASE_* vêm só de `env` (process.env),
+// timeoutRotaMs, ffprobe) é pros testes. SUPABASE_* vêm só de `env` (process.env),
 // nunca do .env.local.
 export async function executar(
   argv,
@@ -135,6 +155,7 @@ export async function executar(
     agora = () => new Date(),
     sufixo,
     timeoutRotaMs = CLI_TIMEOUT_ROTA_MS,
+    ffprobe = ffprobePadrao,
   } = {}
 ) {
   const [comando, ...resto] = argv;
@@ -147,6 +168,7 @@ export async function executar(
   if (comando === "limpar") return limpar({ resto, tem, env, fetch, log });
   const io = { fetch, lerVar, env, log, avisar, agora, sufixo, timeoutRotaMs };
   if (comando === "story") return story({ resto, tem, opt, ...io });
+  if (comando === "reels") return reels({ resto, tem, opt, ffprobe, ...io });
   if (comando !== "publicar") throw new Error(USO);
   if (!tem("--confirmar")) {
     throw new Error("Recusado: publicar exige --confirmar. Só rode com o ok do Vinicius nas imagens e no texto.");
@@ -280,6 +302,96 @@ async function story({ resto, tem, opt, fetch, lerVar, env, log, avisar, agora, 
   });
 }
 
+// ── reels <arquivo.mp4> --legenda <arquivo.txt> ───────────────────────────
+
+// Reels de 1 vídeo. Diferente de publicar/story: sem --confirmar NÃO recusa,
+// faz dry-run (valida, mostra o que faria, zero rede). Com --dry-run também.
+// Só --confirmar sem --dry-run publica: sobe pro Storage (ou usa
+// --base-url), chama a rota com tipo REELS e segue a mesma regra de limpeza.
+async function reels({ resto, tem, opt, fetch, lerVar, env, log, avisar, agora, sufixo, timeoutRotaMs, ffprobe }) {
+  const arquivo = resto[0] && !resto[0].startsWith("--") ? resto[0] : undefined;
+  if (!arquivo) throw new Error(`Falta o arquivo MP4 do Reels.\n${USO}`);
+
+  // Legenda: só de --legenda (não procura instagram-post.txt sozinho).
+  const arquivoLegenda = opt("--legenda");
+  if (!arquivoLegenda) throw new Error(`Falta --legenda <arquivo.txt> (a legenda do Reels). Nada foi enviado.\n${USO}`);
+  let legenda;
+  try {
+    legenda = readFileSync(arquivoLegenda, "utf8");
+  } catch {
+    throw new Error(`Não consegui ler a legenda em ${arquivoLegenda}. Nada foi enviado.`);
+  }
+  try {
+    validarLegenda(legenda); // mesmos limites da rota (2200 caracteres, 30 hashtags, 20 @)
+  } catch (e) {
+    throw new Error(`${arquivoLegenda}: ${e.message} Nada foi enviado.`);
+  }
+
+  // Vídeo: existência, assinatura, 300 MB, duração (ffprobe). Sem rede.
+  const video = validarVideoReels(arquivo, { ffprobe });
+  for (const l of video.linhas) log(l);
+  for (const a of video.avisos) avisar(a);
+
+  const dryRun = tem("--dry-run") || !tem("--confirmar");
+  const conta = opt("--conta") || "eterniza";
+  const corpo = (urls) => ({ conta, tipo: "REELS", itens: urls.map((video_url) => ({ video_url })), legenda, confirmar: true });
+  const base = (lerVar("MANYWATA_URL") || URL_PADRAO).replace(/\/$/, "");
+  const mostrarDryRun = (c) => {
+    log(`[dry-run] POST ${base}${ROTA}  (nada foi enviado)`);
+    log(JSON.stringify(c, null, 2));
+  };
+  if (dryRun && !tem("--confirmar")) {
+    log("[dry-run] sem --confirmar: só mostrando o que seria feito. Pra publicar (com o ok do Vinicius), rode de novo com --confirmar.");
+  }
+
+  // ── Com --base-url: o vídeo já está em <base-url>/<nome do arquivo> ──
+  const baseUrl = opt("--base-url");
+  if (baseUrl) {
+    const c = corpo(montarUrls(baseUrl, [video.nome]));
+    if (dryRun) {
+      mostrarDryRun(c);
+      return null;
+    }
+    return chamarRota({ fetch, base, segredo: exigirSegredo(lerVar), corpo: c, log, timeoutMs: timeoutRotaMs });
+  }
+
+  // ── Sem --base-url: Storage ──
+  // O bucket hoje só aceita JPEG até 8 MB. No dry-run avisa e segue
+  // mostrando o payload; no --confirmar recusa aqui, antes de qualquer rede
+  // (upload condenado).
+  const acimaDoBucket = video.tamanho > MAX_BYTES;
+  if (acimaDoBucket && !dryRun) {
+    throw new Error(`Recusado: ${mensagemLimiteBucket(video.nome, video.tamanho)}\nNada foi enviado.`);
+  }
+  if (acimaDoBucket) avisar(`aviso: ${mensagemLimiteBucket(video.nome, video.tamanho)}`);
+
+  const cred = dryRun ? null : lerCredenciaisStorage(env);
+  const segredo = dryRun ? null : exigirSegredo(lerVar);
+  const slug = sanitizarSlug(video.nome.replace(/\.[^.]*$/, ""), "reels");
+  const prefixo = `${slug}-${carimbo(agora(), sufixo)}`;
+  const nomeNoBucket = `${slug}.${video.extensao}`;
+
+  if (dryRun) {
+    dryRunStorage({ env, prefixo, nomes: [nomeNoBucket], montarCorpo: corpo, mostrarDryRun, log });
+    return null;
+  }
+  // Só aqui lê o vídeo inteiro (já sabe que cabe no bucket).
+  const bytes = readFileSync(arquivo);
+  return publicarViaStorage({
+    arquivos: [{ nome: nomeNoBucket, bytes, contentType: video.contentType }],
+    prefixo,
+    cred,
+    segredo,
+    montarCorpo: corpo,
+    conta,
+    base,
+    fetch,
+    log,
+    avisar,
+    timeoutRotaMs,
+  });
+}
+
 // Story é 9:16; o recomendado é 1080x1920. Fora disso o Instagram corta ou
 // põe borda, mas publica: só avisa.
 export const STORY_LARGURA = 1080;
@@ -295,7 +407,7 @@ function avisarDimensoes(bytes, nome, avisar) {
   }
 }
 
-// ── Partes comuns do fluxo com Storage (publicar e story) ─────────────────
+// ── Partes comuns do fluxo com Storage (publicar, story e reels) ──────────
 
 function dryRunStorage({ env, prefixo, nomes, montarCorpo, mostrarDryRun, log }) {
   let credDry = null;
@@ -305,7 +417,7 @@ function dryRunStorage({ env, prefixo, nomes, montarCorpo, mostrarDryRun, log })
     // só avisa
   }
   const caminhos = montarCaminhos(prefixo, nomes);
-  log(`[dry-run] subiria ${caminhos.length} JPEG(s) pro Supabase Storage (nada foi enviado):`);
+  log(`[dry-run] subiria ${caminhos.length} arquivo(s) pro Supabase Storage (nada foi enviado):`);
   for (const c of caminhos) log(`  ${BUCKET}/${c}`);
   if (!credDry) {
     log("  aviso: SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY ausentes ou inválidas no ambiente; o publicar de verdade vai recusar.");
@@ -322,7 +434,7 @@ async function publicarViaStorage({ arquivos, prefixo, cred, segredo, montarCorp
   let enviados = [];
   let apagar = true; // vira false quando o resultado da rota é INDEFINIDO
   try {
-    log(`Subindo ${arquivos.length} JPEG(s) para ${BUCKET}/${prefixo}/ ...`);
+    log(`Subindo ${arquivos.length} arquivo(s) para ${BUCKET}/${prefixo}/ ...`);
     let urls;
     try {
       ({ caminhos: enviados, urls } = await enviarParaStorage({ arquivos, prefixo, cred, fetch }));
@@ -390,7 +502,11 @@ function indefinido(mensagem) {
 
 async function chamarRota({ fetch, base, segredo, corpo, log, timeoutMs }) {
   const ehStory = corpo.tipo === "STORIES";
-  const oQue = ehStory ? "story (1 imagem)" : `carrossel (${corpo.itens.length} slides)`;
+  const oQue = ehStory
+    ? "story (1 imagem)"
+    : corpo.tipo === "REELS"
+      ? "reels (1 vídeo)"
+      : `carrossel (${corpo.itens.length} slides)`;
   log(`Publicando ${oQue} em "${corpo.conta}"... pode levar alguns minutos (a rota tem até ${MAX_DURATION_S}s).`);
   let r;
   try {

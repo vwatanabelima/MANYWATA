@@ -11,7 +11,8 @@
     "insights:eterniza": "node scripts/insights.mjs --conta eterniza",
     "insights:todas": "node scripts/insights.mjs --conta all",
     "midia": "node scripts/midia.mjs",
-    "midia:publicar": "node scripts/midia.mjs publicar"
+    "midia:publicar": "node scripts/midia.mjs publicar",
+    "midia:reels": "node scripts/midia.mjs reels"
   },
   "devDependencies": {
     "vitest": "^2.1.8"

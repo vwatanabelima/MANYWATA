@@ -1,6 +1,7 @@
-// Hospedagem temporária dos JPEGs no Supabase Storage (projeto eternizacards,
-// bucket público instagram-temp). Quem baixa as imagens é o servidor do Meta,
-// então elas precisam estar numa URL https pública só durante a publicação;
+// Hospedagem temporária das mídias no Supabase Storage (projeto eternizacards,
+// bucket público instagram-temp; hoje só JPEG até 8 MB, ver MAX_BYTES). Quem
+// baixa é o servidor do Meta, então os arquivos precisam estar numa URL https
+// pública só durante a publicação;
 // depois o CLI apaga (quando o resultado é definido; ver scripts/midia.mjs).
 //
 // Credenciais SÓ do ambiente (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY), que o
@@ -17,7 +18,38 @@ import { basename, dirname, join, resolve } from "node:path";
 import { sanitizar } from "../api/_lib/seguranca.js";
 
 export const BUCKET = "instagram-temp";
-export const MAX_BYTES = 8 * 1024 * 1024; // limite do bucket
+
+// Limite ATUAL do bucket instagram-temp: só image/jpeg, até 8 MB por arquivo.
+// Vale pro JPEG (carrossel/story) e, por enquanto, barra também o vídeo do
+// Reels: um MP4 maior que isso (ou qualquer MP4, já que o MIME video/mp4 não
+// está liberado) é recusado pelo Storage. Mudar o bucket (liberar video/mp4 e
+// subir o limite, no máximo até o teto do plano Free, 50 MB) depende do ok do
+// Vinicius e NÃO é feito por este código. Quando mudar, atualize aqui.
+export const MAX_BYTES = 8 * 1024 * 1024;
+
+// Teto de arquivo do plano Free do Supabase ("50 MB"). Não está claro se é
+// 50.000.000 bytes ou 50 MiB; o conservador é o menor.
+export const TETO_FREE_BYTES = 50_000_000;
+
+const mb = (n) => (n / 1_000_000).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+const mib = (n) => (n / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+
+// Explicação de por que um vídeo não sobe no bucket atual. Usada no dry-run
+// (aviso) e no --confirmar (recusa antes de qualquer rede).
+export function mensagemLimiteBucket(nome, tamanho) {
+  const linhas = [
+    `${nome} tem ${mib(tamanho)} MiB (${mb(tamanho)} MB, ${tamanho.toLocaleString("pt-BR")} bytes). O bucket ${BUCKET} hoje aceita só image/jpeg até 8 MB: o Storage vai recusar este upload.`,
+    "  - TUS (upload resumível) não resolve: o limite é do bucket, não do jeito de subir.",
+    "  - Liberar video/mp4 e subir o limite de arquivo do bucket (no máximo até o teto do plano Free, 50 MB) depende do ok do Vinicius. Não muda o plano nem gera custo.",
+  ];
+  if (tamanho > TETO_FREE_BYTES) {
+    linhas.push(
+      `  - Se o teto Free for 50.000.000 bytes (e não 50 MiB), este arquivo não cabe nem depois de ajustar o bucket: reencode o vídeo um pouco menor.`
+    );
+  }
+  linhas.push("  - Alternativa: --base-url com o vídeo já numa URL https pública.");
+  return linhas.join("\n");
+}
 
 // ── Credenciais ───────────────────────────────────────────────────────────
 
@@ -27,7 +59,7 @@ export function lerCredenciaisStorage(env = process.env) {
   if (faltando.length) {
     throw new Error(
       [
-        `Falta ${faltando.join(" e ")} no ambiente (necessário pra subir os JPEGs no Supabase Storage).`,
+        `Falta ${faltando.join(" e ")} no ambiente (necessário pra subir os arquivos no Supabase Storage).`,
         "Carregue do arquivo protegido antes de rodar:",
         "  set -a; . /home/box/.secrets/supabase-eterniza.env; set +a",
         "Ou passe --base-url se as imagens já estão numa URL pública.",
@@ -158,16 +190,21 @@ async function detalhe(r) {
 // Sobe na ordem, um por vez. Se falhar no meio, o erro carrega em .caminhos
 // tudo o que foi tentado (inclusive o que falhou: pode ter chegado ao
 // servidor), pra quem chamou apagar.
+//
+// Cada arquivo pode trazer contentType (padrão image/jpeg; vídeo: video/mp4).
+// Upload padrão: um POST só, sem TUS. Hoje o bucket recusa > 8 MB de
+// qualquer jeito; se ele for ampliado, arquivos > 6 MB sobem de forma mais
+// confiável por TUS, mas o POST padrão aceita até o limite do plano.
 export async function enviarParaStorage({ arquivos, prefixo, cred, fetch = globalThis.fetch }) {
   const caminhos = [];
-  for (const { nome, bytes } of arquivos) {
+  for (const { nome, bytes, contentType = "image/jpeg" } of arquivos) {
     const caminho = `${prefixo}/${nome}`;
     caminhos.push(caminho);
     let r;
     try {
       r = await fetch(`${cred.url}/storage/v1/object/${BUCKET}/${codificar(caminho)}`, {
         method: "POST",
-        headers: { ...headers(cred.chave, "image/jpeg"), "x-upsert": "false" },
+        headers: { ...headers(cred.chave, contentType), "x-upsert": "false" },
         body: bytes,
       });
     } catch (e) {

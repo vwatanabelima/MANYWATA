@@ -21,6 +21,13 @@
 export const MAX_DURATION_S = 300;
 export const ORCAMENTO_CONTAINERS_MS = 240_000;
 
+// Reels tem UM container só (sem filhos, sem CAROUSEL depois), então pode
+// usar mais do orçamento: 270s, deixando 30s pra media_publish, permalink e
+// resposta. Mesmo assim vídeo longo pode levar mais que isso pra ficar
+// FINISHED e a rota responde 504 (nada publicado). Dividir em duas chamadas
+// (cria / checa e publica) é outro desenho, fora daqui.
+export const ORCAMENTO_REELS_MS = 270_000;
+
 // aguardarStatus: mesmo com orçamento estourado (ou <= 0), checa de verdade
 // e espera pelo menos isto antes de desistir. Evita o 504 "em 0s" de quando
 // a criação dos containers comia o orçamento todo.
