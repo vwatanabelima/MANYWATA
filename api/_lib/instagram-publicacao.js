@@ -12,6 +12,12 @@
 // O token vai no header Authorization: Bearer (graph.instagram.com aceita),
 // nunca na query string, então não aparece em URL nenhuma. Mesmo assim toda
 // mensagem de erro passa por sanitizar().
+//
+// Reels pelo CLI usa outro caminho (criarContainerResumivel +
+// enviarVideoResumivel): container com upload_type=resumable e o MP4 vai
+// direto pro rupload.facebook.com com "Authorization: OAuth <token>". Isso
+// roda só na máquina do operador; a rota da Vercel não recebe o vídeo nem
+// devolve o token.
 
 import { ErroHttp, sanitizar, validarUrlPublica } from "./seguranca.js";
 import {
@@ -23,6 +29,34 @@ import {
 } from "./tempos.js";
 
 export const GRAPH = "https://graph.instagram.com/v21.0";
+
+// Upload resumível de vídeo (Reels pelo CLI). O POST /media com
+// upload_type=resumable devolve { id, uri }; o binário vai pra essa uri com
+// "Authorization: OAuth <token>". Se o Meta não devolver uri, monta-se esta
+// (mesma versão do GRAPH). Só aceitamos uri neste host e neste caminho: o
+// token vai junto, então NUNCA mandamos pra outro lugar.
+export const RUPLOAD_HOST = "rupload.facebook.com";
+export const RUPLOAD_CAMINHO = "/ig-api-upload/";
+export const RUPLOAD = `https://${RUPLOAD_HOST}${RUPLOAD_CAMINHO}${new URL(GRAPH).pathname.replace(/^\//, "")}`;
+
+// uri de upload aceitável: https://rupload.facebook.com/ig-api-upload/...,
+// sem usuário/senha nem porta. Devolve a URL normalizada ou null.
+export function uriRuploadValida(uri) {
+  let u;
+  try {
+    u = new URL(String(uri));
+  } catch {
+    return null;
+  }
+  const ok =
+    u.protocol === "https:" &&
+    u.hostname.toLowerCase() === RUPLOAD_HOST &&
+    !u.port &&
+    !u.username &&
+    !u.password &&
+    u.pathname.startsWith(RUPLOAD_CAMINHO);
+  return ok ? u.href : null;
+}
 
 // Regras do Meta (não do código). Fonte: docs de Content Publishing.
 export const LIMITES = {
@@ -40,6 +74,9 @@ const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const DICA_ERRO_IMAGEM = "Confira se a URL abre de fora e é um JPEG.";
 const DICA_ERRO_VIDEO =
   "Confira se a URL abre de fora e se o vídeo está nos limites do Reels (MP4/MOV, H.264/HEVC + AAC, 3s a 15min, até 300 MB).";
+// Mesma coisa, pro vídeo que subiu direto pelo rupload (não tem URL).
+export const DICA_ERRO_VIDEO_UPLOAD =
+  "Confira se o vídeo está nos limites do Reels (MP4/MOV, H.264/HEVC + AAC, 3s a 15min, até 300 MB).";
 
 // ── Cliente do Graph para UMA conta ───────────────────────────────────────
 
@@ -87,6 +124,94 @@ export function criarPublicador({
     const r = await graph("POST", `${userId}/media`, params);
     if (!r.id) throw new ErroHttp(502, "Instagram não devolveu o id do container.");
     return String(r.id);
+  }
+
+  // ── Reels por upload resumível (só o CLI usa; a rota segue com video_url) ──
+  //
+  // 1. POST /{user-id}/media com media_type=REELS + upload_type=resumable (+
+  //    caption se houver). SEM video_url. Devolve { id, uri }. Se a uri vier,
+  //    usa ela (só se for rupload.facebook.com/ig-api-upload/...); se não
+  //    vier, monta RUPLOAD/{id}.
+  //    Capa (opcional, uma OU outra; o Meta ignora thumb_offset se vier
+  //    cover_url, então nem deixamos mandar as duas):
+  //      coverUrl    → cover_url: JPEG numa URL https pública (o Meta baixa)
+  //      thumbOffset → thumb_offset: frame do próprio vídeo, em ms (inteiro >= 0)
+  //    Sem nenhuma, o Instagram escolhe o frame. Campo ausente = não vai.
+  async function criarContainerResumivel({ legenda, coverUrl, thumbOffset } = {}) {
+    const temCapa = coverUrl !== undefined && coverUrl !== null && coverUrl !== "";
+    const temOffset = thumbOffset !== undefined && thumbOffset !== null;
+    if (temCapa && temOffset) throw new ErroHttp(400, "use cover_url OU thumb_offset, não os dois.");
+    if (temOffset && (!Number.isSafeInteger(thumbOffset) || thumbOffset < 0)) {
+      throw new ErroHttp(400, "thumb_offset precisa ser um inteiro >= 0 (milissegundos).");
+    }
+    const params = { media_type: "REELS", upload_type: "resumable" };
+    if (legenda) params.caption = legenda;
+    if (temCapa) params.cover_url = validarUrlPublica(coverUrl, "cover_url");
+    if (temOffset) params.thumb_offset = thumbOffset;
+    const r = await graph("POST", `${userId}/media`, params);
+    if (!r.id) throw new ErroHttp(502, "Instagram não devolveu o id do container.");
+    const id = String(r.id);
+    if (r.uri === undefined || r.uri === null || r.uri === "") {
+      return { id, uri: `${RUPLOAD}/${encodeURIComponent(id)}` };
+    }
+    const uri = uriRuploadValida(r.uri);
+    if (!uri) {
+      let host = "?";
+      try {
+        host = new URL(String(r.uri)).host || "?";
+      } catch {
+        // uri nem é URL
+      }
+      throw new ErroHttp(
+        502,
+        sanitizar(
+          `Instagram devolveu uma uri de upload fora de https://${RUPLOAD_HOST}${RUPLOAD_CAMINHO} (host: ${host}); o vídeo e o token não foram enviados pra lá.`,
+          [token]
+        )
+      );
+    }
+    return { id, uri };
+  }
+
+  // 2. POST do binário na uri, de uma vez (offset 0, sem retomada). Headers
+  //    como na doc: Authorization: OAuth <token>, offset, file_size. corpo é
+  //    o MP4 (Buffer/Uint8Array/Blob). Sucesso = HTTP ok + {"success": true}.
+  //    Qualquer outra coisa (HTTP de erro, success ausente, rede, timeout) →
+  //    ErroHttp; quem chama sabe que o media_publish ainda não aconteceu.
+  async function enviarVideoResumivel(uri, { corpo, tamanho, timeoutMs } = {}) {
+    const destino = uriRuploadValida(uri);
+    if (!destino) throw new ErroHttp(400, `uri de upload recusada: precisa ser https://${RUPLOAD_HOST}${RUPLOAD_CAMINHO}...`);
+    if (!Number.isSafeInteger(tamanho) || tamanho <= 0) throw new ErroHttp(400, "tamanho do vídeo inválido pro upload.");
+
+    const init = {
+      method: "POST",
+      headers: { Authorization: `OAuth ${token}`, offset: "0", file_size: String(tamanho) },
+      body: corpo,
+    };
+    if (timeoutMs) init.signal = AbortSignal.timeout(timeoutMs);
+
+    let resposta;
+    try {
+      resposta = await fetchFn(destino, init);
+    } catch (e) {
+      const abortou = e?.name === "TimeoutError" || e?.name === "AbortError";
+      throw new ErroHttp(
+        502,
+        sanitizar(
+          abortou
+            ? `upload do vídeo pro ${RUPLOAD_HOST} não terminou em ${Math.round(timeoutMs / 1000)}s.`
+            : `falha de rede no upload do vídeo pro ${RUPLOAD_HOST}: ${e?.message}`,
+          [token]
+        )
+      );
+    }
+    const dados = await resposta.json().catch(() => null);
+    if (!resposta.ok || dados?.success !== true) {
+      const detalhe =
+        dados?.debug_info?.message || dados?.error?.message || dados?.message || (resposta.ok ? "resposta sem success: true" : `HTTP ${resposta.status}`);
+      throw new ErroHttp(502, sanitizar(`${RUPLOAD_HOST} recusou o upload do vídeo (HTTP ${resposta.status}): ${detalhe}`, [token]));
+    }
+    return dados;
   }
 
   // Polling de status_code até FINISHED. Imagem costuma sair em segundos;
@@ -165,7 +290,16 @@ export function criarPublicador({
     return r.permalink || null;
   }
 
-  return { now, criarContainer, aguardarStatus, checarLimitePublicacao, publicarContainer, buscarPermalink };
+  return {
+    now,
+    criarContainer,
+    criarContainerResumivel,
+    enviarVideoResumivel,
+    aguardarStatus,
+    checarLimitePublicacao,
+    publicarContainer,
+    buscarPermalink,
+  };
 }
 
 // ── Validações comuns ─────────────────────────────────────────────────────

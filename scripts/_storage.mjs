@@ -19,37 +19,11 @@ import { sanitizar } from "../api/_lib/seguranca.js";
 
 export const BUCKET = "instagram-temp";
 
-// Limite ATUAL do bucket instagram-temp: só image/jpeg, até 8 MB por arquivo.
-// Vale pro JPEG (carrossel/story) e, por enquanto, barra também o vídeo do
-// Reels: um MP4 maior que isso (ou qualquer MP4, já que o MIME video/mp4 não
-// está liberado) é recusado pelo Storage. Mudar o bucket (liberar video/mp4 e
-// subir o limite, no máximo até o teto do plano Free, 50 MB) depende do ok do
-// Vinicius e NÃO é feito por este código. Quando mudar, atualize aqui.
+// Limite do bucket instagram-temp: só image/jpeg, até 8 MB por arquivo. Vale
+// pro JPEG do carrossel, do story e da capa do Reels (--capa). O vídeo do
+// Reels NÃO passa por aqui (o CLI manda direto pro upload resumível do
+// Instagram), então este limite não se aplica a ele.
 export const MAX_BYTES = 8 * 1024 * 1024;
-
-// Teto de arquivo do plano Free do Supabase ("50 MB"). Não está claro se é
-// 50.000.000 bytes ou 50 MiB; o conservador é o menor.
-export const TETO_FREE_BYTES = 50_000_000;
-
-const mb = (n) => (n / 1_000_000).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
-const mib = (n) => (n / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 2 });
-
-// Explicação de por que um vídeo não sobe no bucket atual. Usada no dry-run
-// (aviso) e no --confirmar (recusa antes de qualquer rede).
-export function mensagemLimiteBucket(nome, tamanho) {
-  const linhas = [
-    `${nome} tem ${mib(tamanho)} MiB (${mb(tamanho)} MB, ${tamanho.toLocaleString("pt-BR")} bytes). O bucket ${BUCKET} hoje aceita só image/jpeg até 8 MB: o Storage vai recusar este upload.`,
-    "  - TUS (upload resumível) não resolve: o limite é do bucket, não do jeito de subir.",
-    "  - Liberar video/mp4 e subir o limite de arquivo do bucket (no máximo até o teto do plano Free, 50 MB) depende do ok do Vinicius. Não muda o plano nem gera custo.",
-  ];
-  if (tamanho > TETO_FREE_BYTES) {
-    linhas.push(
-      `  - Se o teto Free for 50.000.000 bytes (e não 50 MiB), este arquivo não cabe nem depois de ajustar o bucket: reencode o vídeo um pouco menor.`
-    );
-  }
-  linhas.push("  - Alternativa: --base-url com o vídeo já numa URL https pública.");
-  return linhas.join("\n");
-}
 
 // ── Credenciais ───────────────────────────────────────────────────────────
 
@@ -191,10 +165,9 @@ async function detalhe(r) {
 // tudo o que foi tentado (inclusive o que falhou: pode ter chegado ao
 // servidor), pra quem chamou apagar.
 //
-// Cada arquivo pode trazer contentType (padrão image/jpeg; vídeo: video/mp4).
-// Upload padrão: um POST só, sem TUS. Hoje o bucket recusa > 8 MB de
-// qualquer jeito; se ele for ampliado, arquivos > 6 MB sobem de forma mais
-// confiável por TUS, mas o POST padrão aceita até o limite do plano.
+// Cada arquivo pode trazer contentType (padrão image/jpeg, que é o único que
+// o bucket aceita: slides, story e a capa do Reels). Upload padrão: um POST
+// só, sem TUS (os JPEGs têm no máximo 8 MB).
 export async function enviarParaStorage({ arquivos, prefixo, cred, fetch = globalThis.fetch }) {
   const caminhos = [];
   for (const { nome, bytes, contentType = "image/jpeg" } of arquivos) {
